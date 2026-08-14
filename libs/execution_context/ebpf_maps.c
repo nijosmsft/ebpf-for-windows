@@ -4525,6 +4525,24 @@ typedef struct _ebpf_custom_map
     EX_RUNDOWN_REF provider_rundown_reference; // Synchronization for provider access.
 } ebpf_custom_map_t;
 
+/**
+ * @brief Return the version 2 view of the attached provider dispatch table, or NULL when the provider only published a
+ * version 1 table.
+ *
+ * The attach path always allocates a version 2-sized buffer and zero-fills the appended tail, so the version 2 fields
+ * are always addressable. The header version field published by the provider is the authority on whether those fields
+ * are meaningful, so this gate keeps version 1 providers on exactly their version 1 behavior.
+ */
+static inline const ebpf_base_map_provider_dispatch_table_v2_t*
+_ebpf_custom_map_provider_dispatch_v2(_In_ const ebpf_custom_map_t* custom_map)
+{
+    const ebpf_base_map_provider_dispatch_table_t* dispatch = custom_map->provider_dispatch;
+    if (dispatch != NULL && dispatch->header.version >= EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2) {
+        return (const ebpf_base_map_provider_dispatch_table_v2_t*)dispatch;
+    }
+    return NULL;
+}
+
 static ebpf_map_client_data_t _ebpf_custom_map_client_data = {
     EBPF_MAP_CLIENT_DATA_HEADER,
     offsetof(ebpf_custom_map_t, core_map) + offsetof(ebpf_core_map_t, custom_map_context),
@@ -4692,11 +4710,17 @@ _ebpf_custom_map_update_hash_map_entry(
     }
     uint8_t* out_value = NULL;
     uint32_t provider_flags;
+    const uint8_t* new_value = NULL;
+    void* mutation_token = NULL;
+    bool mutation_admitted = false;
+    ebpf_map_mutation_completion_v2_t completion = EBPF_MAP_MUTATION_COMPLETION_COMMIT;
+    ebpf_custom_map_operation_context_t operation_context = {flags, true};
 
     UNREFERENCED_PARAMETER(key_size);
     UNREFERENCED_PARAMETER(value_size);
 
     ebpf_custom_map_t* custom_map = EBPF_FROM_FIELD(ebpf_custom_map_t, core_map, map);
+    const ebpf_base_map_provider_dispatch_table_v2_t* dispatch_v2 = _ebpf_custom_map_provider_dispatch_v2(custom_map);
 
     if (UPDATE_ORIGINAL_VALUE_FLAG_PRESENT(custom_map->provider_flags)) {
         // If provider updates original value, allocate a local buffer to hold the new value.
@@ -4706,6 +4730,26 @@ _ebpf_custom_map_update_hash_map_entry(
             return EBPF_NO_MEMORY;
         }
         memset(out_value, 0, custom_map->actual_value_size);
+    }
+
+    // Version 2 mutation admission gate. The provider owns the gate state (admission-closed / in-flight count); the
+    // runtime only asks permission here. On admission (a non-NULL token), the runtime guarantees exactly one matching
+    // completion call below, regardless of which later step fails. If admission is refused, the base map is left
+    // untouched and no completion is owed.
+    if (dispatch_v2 != NULL && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
+        provider_flags = _get_provider_flags(flags, true);
+        result = dispatch_v2->preprocess_map_mutation_v2(
+            custom_map->provider_context,
+            custom_map->core_map.custom_map_context,
+            EBPF_MAP_MUTATION_OPERATION_UPDATE,
+            custom_map->core_map.ebpf_map_definition.key_size,
+            key,
+            provider_flags,
+            &mutation_token);
+        if (result != EBPF_SUCCESS) {
+            goto Exit;
+        }
+        mutation_admitted = (mutation_token != NULL);
     }
 
     if (custom_map->provider_dispatch->preprocess_map_update_element) {
@@ -4729,26 +4773,51 @@ _ebpf_custom_map_update_hash_map_entry(
             provider_flags);
 
         if (result != EBPF_SUCCESS) {
-            goto Exit;
+            // The provider rejected the value after the mutation was admitted.
+            completion = EBPF_MAP_MUTATION_COMPLETION_PROVIDER_REJECT;
+            goto Complete;
         }
     }
 
-    const uint8_t* new_value = out_value ? out_value : value;
-    ebpf_custom_map_operation_context_t operation_context = {flags, true};
+    new_value = out_value ? out_value : value;
 
     result = _update_hash_map_entry_operation_context(map, (uint8_t*)&operation_context, key, new_value, option);
-    if (result != EBPF_SUCCESS && HAS_DELETE_ELEMENT_CALLBACK(custom_map->provider_dispatch)) {
-        // The hash map update failed after the provider was notified of the add.
-        // Notify the provider of the deletion to undo the add.
+    if (result != EBPF_SUCCESS) {
+        // The base map operation failed after admission: this is a rollback, not a provider rejection.
+        completion = EBPF_MAP_MUTATION_COMPLETION_ROLLBACK;
+        if (HAS_DELETE_ELEMENT_CALLBACK(custom_map->provider_dispatch)) {
+            // The hash map update failed after the provider was notified of the add.
+            // Notify the provider of the deletion to undo the add.
+            provider_flags = _get_provider_flags(flags, true);
+            _invoke_delete_element_callback(
+                custom_map->provider_dispatch,
+                custom_map->provider_context,
+                custom_map->core_map.custom_map_context,
+                custom_map->core_map.ebpf_map_definition.key_size,
+                key,
+                custom_map->actual_value_size,
+                new_value,
+                provider_flags);
+        }
+    } else {
+        completion = EBPF_MAP_MUTATION_COMPLETION_COMMIT;
+    }
+
+Complete:
+    if (mutation_admitted && dispatch_v2 != NULL && dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
+        // Exactly one completion per admitted token. The value reported reflects what the base map holds/attempted.
+        const uint8_t* completion_value = out_value ? out_value : value;
         provider_flags = _get_provider_flags(flags, true);
-        _invoke_delete_element_callback(
-            custom_map->provider_dispatch,
+        dispatch_v2->postprocess_map_mutation_complete_v2(
             custom_map->provider_context,
             custom_map->core_map.custom_map_context,
+            mutation_token,
+            EBPF_MAP_MUTATION_OPERATION_UPDATE,
+            completion,
             custom_map->core_map.ebpf_map_definition.key_size,
             key,
             custom_map->actual_value_size,
-            new_value,
+            completion_value,
             provider_flags);
     }
 
@@ -5046,9 +5115,11 @@ _ebpf_custom_map_client_attach_provider(
     }
 
     // Provider supports the requested map type.
-    // Create a cache-aligned copy of the dispatch table for hot path performance.
+    // Create a cache-aligned copy of the dispatch table for hot path performance. The buffer is always sized to the
+    // version 2 (superset) table so that version 2 callbacks are addressable; for a version 1 provider the appended
+    // version 2 fields simply remain zero (NULL), which the runtime interprets as "callback not supplied".
     provider_dispatch_table = (ebpf_base_map_provider_dispatch_table_t*)ebpf_allocate_cache_aligned_with_tag(
-        sizeof(ebpf_base_map_provider_dispatch_table_t), EBPF_POOL_TAG_CUSTOM_MAP);
+        sizeof(ebpf_base_map_provider_dispatch_table_v2_t), EBPF_POOL_TAG_CUSTOM_MAP);
     if (!provider_dispatch_table) {
         status = STATUS_NO_MEMORY;
         goto Done;
@@ -5080,7 +5151,7 @@ _ebpf_custom_map_client_attach_provider(
     memcpy(
         provider_dispatch_table,
         provider_data->base_provider_table,
-        min(sizeof(ebpf_base_map_provider_dispatch_table_t), provider_data->base_provider_table->header.size));
+        min(sizeof(ebpf_base_map_provider_dispatch_table_v2_t), provider_data->base_provider_table->header.size));
     custom_map->provider_dispatch = provider_dispatch_table;
     provider_dispatch_table = NULL;
 
@@ -5292,11 +5363,70 @@ ebpf_custom_map_delete_entry(_In_ ebpf_map_t* map, size_t key_size, _In_reads_(k
     }
 
     if (custom_map->base_map_type == BPF_MAP_TYPE_HASH) {
+        const ebpf_base_map_provider_dispatch_table_v2_t* dispatch_v2 =
+            _ebpf_custom_map_provider_dispatch_v2(custom_map);
+        uint32_t provider_flags = _get_provider_flags(flags, false);
+        void* mutation_token = NULL;
+        bool mutation_admitted = false;
+        ebpf_map_mutation_completion_v2_t completion = EBPF_MAP_MUTATION_COMPLETION_COMMIT;
+        ebpf_result_t result = EBPF_SUCCESS;
         ebpf_custom_map_operation_context_t operation_context = {0};
         operation_context.flags = flags;
 
-        ebpf_result_t result =
-            _delete_hash_map_entry_operation_context(&custom_map->core_map, (uint8_t*)&operation_context, key);
+        // Version 2 mutation admission gate for delete. Mirrors the update path: provider-owned gate, and any admitted
+        // (non-NULL) token gets exactly one completion below.
+        if (dispatch_v2 != NULL && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
+            result = dispatch_v2->preprocess_map_mutation_v2(
+                custom_map->provider_context,
+                custom_map->core_map.custom_map_context,
+                EBPF_MAP_MUTATION_OPERATION_DELETE,
+                custom_map->core_map.ebpf_map_definition.key_size,
+                key,
+                provider_flags,
+                &mutation_token);
+            if (result != EBPF_SUCCESS) {
+                // Not admitted: base map untouched, no completion owed.
+                return result;
+            }
+            mutation_admitted = (mutation_token != NULL);
+        }
+
+        // Rejectable normal-delete callback. Per the contract this fires only for normal user-initiated deletes, never
+        // for helper calls, update-driven replacements, or map cleanup (those use postprocess_map_delete_element via
+        // the hash-table free notification and must not fail).
+        if (dispatch_v2 != NULL && dispatch_v2->preprocess_map_delete_element_v2 != NULL &&
+            !(flags & EBPF_MAP_FLAG_HELPER)) {
+            result = dispatch_v2->preprocess_map_delete_element_v2(
+                custom_map->provider_context,
+                custom_map->core_map.custom_map_context,
+                custom_map->core_map.ebpf_map_definition.key_size,
+                key,
+                provider_flags);
+            if (result != EBPF_SUCCESS) {
+                // Provider rejected the normal delete after admission.
+                completion = EBPF_MAP_MUTATION_COMPLETION_PROVIDER_REJECT;
+                goto Complete;
+            }
+        }
+
+        result = _delete_hash_map_entry_operation_context(&custom_map->core_map, (uint8_t*)&operation_context, key);
+        completion =
+            (result == EBPF_SUCCESS) ? EBPF_MAP_MUTATION_COMPLETION_COMMIT : EBPF_MAP_MUTATION_COMPLETION_ROLLBACK;
+
+    Complete:
+        if (mutation_admitted && dispatch_v2 != NULL && dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
+            dispatch_v2->postprocess_map_mutation_complete_v2(
+                custom_map->provider_context,
+                custom_map->core_map.custom_map_context,
+                mutation_token,
+                EBPF_MAP_MUTATION_OPERATION_DELETE,
+                completion,
+                custom_map->core_map.ebpf_map_definition.key_size,
+                key,
+                0,
+                NULL,
+                provider_flags);
+        }
         return result;
     } else {
         EBPF_LOG_MESSAGE_UINT64(
@@ -5346,5 +5476,170 @@ ebpf_custom_map_associate_program(_Inout_ ebpf_map_t* map, _In_ const struct _eb
         custom_map->provider_context, custom_map->core_map.custom_map_context, &program_type);
 
     return result;
+}
+
+// Opaque token that pins a custom-map provider's rundown reference for an entire activation lifetime. A snapshot of
+// the provider dispatch pointer, binding context, and map context is captured at activation time so that deactivation
+// never has to re-read them from the map or re-acquire rundown.
+typedef struct _ebpf_provider_rundown_token
+{
+    ebpf_custom_map_t* custom_map;
+    const ebpf_base_map_provider_dispatch_table_v2_t* dispatch;
+    void* provider_context;
+    void* map_context;
+} ebpf_provider_rundown_token_impl_t;
+
+/**
+ * @brief Resolve a caller-supplied map object pointer to a custom map of the expected type.
+ *
+ * Validates that the object is a live map object, is a custom map (has a provider-supplied map context), and matches
+ * the expected map type. Does not acquire any reference.
+ */
+static ebpf_result_t
+_ebpf_resolve_custom_map_of_type(
+    _In_opt_ const void* map_object, ebpf_map_type_t expected_map_type, _Outptr_ ebpf_custom_map_t** custom_map_out)
+{
+    *custom_map_out = NULL;
+    if (map_object == NULL) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+
+    ebpf_core_object_t* object = (ebpf_core_object_t*)map_object;
+    if (object->type != EBPF_OBJECT_MAP) {
+        return EBPF_INVALID_OBJECT;
+    }
+
+    ebpf_core_map_t* core_map = (ebpf_core_map_t*)map_object;
+    if (core_map->custom_map_context == NULL) {
+        // Not a custom map (built-in maps have no provider context).
+        return EBPF_INVALID_OBJECT;
+    }
+    if ((ebpf_map_type_t)core_map->ebpf_map_definition.type != expected_map_type) {
+        return EBPF_INVALID_OBJECT;
+    }
+
+    *custom_map_out = CONTAINING_RECORD(core_map, ebpf_custom_map_t, core_map);
+    return EBPF_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL) _Must_inspect_result_ ebpf_result_t
+    ebpf_map_try_reference_provider_context_from_helper(
+        _In_ const void* helper_map_argument,
+        ebpf_map_type_t expected_map_type,
+        _Out_ ebpf_map_provider_reference_t* map_reference)
+{
+    if (map_reference == NULL) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+    memset(map_reference, 0, sizeof(*map_reference));
+
+    ebpf_custom_map_t* custom_map = NULL;
+    ebpf_result_t result = _ebpf_resolve_custom_map_of_type(helper_map_argument, expected_map_type, &custom_map);
+    if (result != EBPF_SUCCESS) {
+        return result;
+    }
+
+    // Increment the existing (nonzero) object reference. The caller holds the map argument live for the duration of
+    // this call, so the object is guaranteed to still be referenced here.
+    EBPF_OBJECT_ACQUIRE_REFERENCE((ebpf_core_object_t*)&custom_map->core_map.object);
+
+    map_reference->map_object = &custom_map->core_map;
+    map_reference->provider_map_context = custom_map->core_map.custom_map_context;
+    map_reference->map_type = expected_map_type;
+    return EBPF_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL) void ebpf_map_release_provider_reference(
+    _In_ const ebpf_map_provider_reference_t* map_reference)
+{
+    if (map_reference == NULL || map_reference->map_object == NULL) {
+        return;
+    }
+    ebpf_core_map_t* core_map = (ebpf_core_map_t*)map_reference->map_object;
+    EBPF_OBJECT_RELEASE_REFERENCE((ebpf_core_object_t*)&core_map->object);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_map_invoke_provider_activate(
+    _In_ const ebpf_map_provider_reference_t* map_reference,
+    _In_ const ebpf_map_provider_activate_context_v1_t* context,
+    _Outptr_result_maybenull_ void** activation_context,
+    _Outptr_ ebpf_provider_rundown_token_t** rundown_token)
+{
+    if (activation_context != NULL) {
+        *activation_context = NULL;
+    }
+    if (rundown_token != NULL) {
+        *rundown_token = NULL;
+    }
+
+    if (map_reference == NULL || context == NULL || activation_context == NULL || rundown_token == NULL) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+    if (context->version != EBPF_MAP_PROVIDER_ACTIVATE_CONTEXT_VERSION_1 ||
+        context->size < sizeof(ebpf_map_provider_activate_context_v1_t)) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+
+    ebpf_custom_map_t* custom_map = NULL;
+    ebpf_result_t result =
+        _ebpf_resolve_custom_map_of_type(map_reference->map_object, map_reference->map_type, &custom_map);
+    if (result != EBPF_SUCCESS) {
+        return result;
+    }
+
+    const ebpf_base_map_provider_dispatch_table_v2_t* dispatch_v2 = _ebpf_custom_map_provider_dispatch_v2(custom_map);
+    if (dispatch_v2 == NULL || dispatch_v2->preprocess_map_activate == NULL) {
+        return EBPF_OPERATION_NOT_SUPPORTED;
+    }
+
+    ebpf_provider_rundown_token_impl_t* token =
+        (ebpf_provider_rundown_token_impl_t*)ebpf_allocate_with_tag(sizeof(*token), EBPF_POOL_TAG_CUSTOM_MAP);
+    if (token == NULL) {
+        return EBPF_NO_MEMORY;
+    }
+
+    // Acquire the provider rundown reference. The token holds this reference for the whole activation lifetime, so the
+    // provider cannot complete unregister/unload until the matching deactivation runs.
+    if (!ExAcquireRundownProtection(&custom_map->provider_rundown_reference)) {
+        ebpf_free(token);
+        return EBPF_EXTENSION_FAILED_TO_LOAD;
+    }
+    token->custom_map = custom_map;
+    token->dispatch = dispatch_v2;
+    token->provider_context = custom_map->provider_context;
+    token->map_context = custom_map->core_map.custom_map_context;
+
+    result =
+        dispatch_v2->preprocess_map_activate(token->provider_context, token->map_context, context, activation_context);
+    if (result != EBPF_SUCCESS) {
+        // Activation failed: release the rundown reference and return no token.
+        *activation_context = NULL;
+        ExReleaseRundownProtection(&custom_map->provider_rundown_reference);
+        ebpf_free(token);
+        return result;
+    }
+
+    *rundown_token = (ebpf_provider_rundown_token_t*)token;
+    return EBPF_SUCCESS;
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL) void ebpf_map_invoke_provider_deactivate(
+    _In_ const ebpf_map_provider_reference_t* map_reference,
+    _In_opt_ void* activation_context,
+    _In_ _Post_invalid_ ebpf_provider_rundown_token_t* rundown_token)
+{
+    UNREFERENCED_PARAMETER(map_reference);
+    if (rundown_token == NULL) {
+        return;
+    }
+    ebpf_provider_rundown_token_impl_t* token = (ebpf_provider_rundown_token_impl_t*)rundown_token;
+
+    if (token->dispatch != NULL && token->dispatch->postprocess_map_deactivate != NULL) {
+        token->dispatch->postprocess_map_deactivate(token->provider_context, token->map_context, activation_context);
+    }
+
+    // Release the provider rundown reference held since activation, invalidating the token.
+    ExReleaseRundownProtection(&token->custom_map->provider_rundown_reference);
+    ebpf_free(token);
 }
 #pragma endregion

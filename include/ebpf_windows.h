@@ -193,6 +193,20 @@ typedef enum _ebpf_helper_function
      EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_CURRENT_VERSION_SIZE, \
      EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_CURRENT_VERSION_TOTAL_SIZE}
 
+// Version 2 of the base map provider dispatch table. This is an append-only superset of version 1 that adds the
+// mutation token/completion, activation/deactivation, and rejectable-delete callbacks. The current version macro is
+// intentionally NOT bumped: version 1 providers remain valid and the generic header validator continues to accept
+// them. A provider opts into version 2 by publishing a header whose version field is
+// EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2 and whose size covers at least EBPF_..._V2_SIZE.
+#define EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2 2
+#define EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_SIZE \
+    EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_provider_dispatch_table_v2_t, preprocess_map_delete_element_v2)
+#define EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_TOTAL_SIZE sizeof(ebpf_base_map_provider_dispatch_table_v2_t)
+#define EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_HEADER \
+    {EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2,   \
+     EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_SIZE,     \
+     EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_TOTAL_SIZE}
+
 #define EBPF_BASE_MAP_PROVIDER_PROPERTIES_CURRENT_VERSION 1
 #define EBPF_BASE_MAP_PROVIDER_PROPERTIES_CURRENT_VERSION_SIZE \
     EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_provider_properties_t, updates_original_value)

@@ -6,6 +6,7 @@
 #include "catch_wrapper.hpp"
 #include "ebpf_async.h"
 #include "ebpf_core.h"
+#include "ebpf_epoch.h"
 #include "ebpf_maps.h"
 #include "ebpf_object.h"
 #include "ebpf_program.h"
@@ -14,9 +15,12 @@
 #include "helpers.h"
 #include "test_helper.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <iomanip>
 #include <optional>
 #include <set>
+#include <thread>
 
 extern "C"
 {
@@ -2810,3 +2814,476 @@ TEST_CASE("INVALID_GENERAL_HELPER_PROGRAM_DATA", "[execution_context][negative]"
 // https://github.com/microsoft/ebpf-for-windows/issues/1139
 // EBPF_OPERATION_LOAD_NATIVE_MODULE
 // EBPF_OPERATION_LOAD_NATIVE_PROGRAMS
+
+//
+// CPUMAP (software RSS) map-type and dispatch-table version 2 tests (increment 1).
+//
+// These exercise the new version 2 base-map-provider ABI: the mutation token/completion gate, the
+// activation/deactivation callbacks and their rundown token, the rejectable version 2 delete, and the runtime
+// wrapper APIs (reference/activate/deactivate). The mock CPUMAP provider lives in helpers.h and publishes a version 2
+// dispatch table; the base CRUD callbacks are shared with the sample hash map provider.
+//
+
+// Build a zero-initialized activation-context wrapper with a valid size/version.
+static ebpf_map_provider_activate_context_v1_t
+_make_cpumap_activate_context()
+{
+    ebpf_map_provider_activate_context_v1_t context = {0};
+    context.size = sizeof(ebpf_map_provider_activate_context_v1_t);
+    context.version = EBPF_MAP_PROVIDER_ACTIVATE_CONTEXT_VERSION_1;
+    context.program_type = EBPF_PROGRAM_TYPE_SAMPLE;
+    return context;
+}
+
+// Create a CPUMAP map bound to the supplied (already-initialized) mock provider.
+static ebpf_map_t*
+_create_cpumap_map(
+    uint32_t key_size = sizeof(uint32_t), uint32_t value_size = sizeof(uint32_t), uint32_t max_entries = 4)
+{
+    ebpf_map_definition_in_memory_t map_definition{BPF_MAP_TYPE_CPUMAP, key_size, value_size, max_entries};
+    cxplat_utf8_string_t map_name = {0};
+    ebpf_map_t* local_map = nullptr;
+    REQUIRE(ebpf_map_create(&map_name, &map_definition, (uintptr_t)ebpf_handle_invalid, &local_map) == EBPF_SUCCESS);
+    return local_map;
+}
+
+TEST_CASE("cpumap_runtime_api_negatives", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map());
+
+    // A built-in (non-custom) map has no provider context and must never resolve as a CPUMAP.
+    map_ptr array_map;
+    {
+        ebpf_map_definition_in_memory_t array_definition{BPF_MAP_TYPE_ARRAY, sizeof(uint32_t), sizeof(uint32_t), 4};
+        cxplat_utf8_string_t array_name = {0};
+        ebpf_map_t* local_array = nullptr;
+        REQUIRE(
+            ebpf_map_create(&array_name, &array_definition, (uintptr_t)ebpf_handle_invalid, &local_array) ==
+            EBPF_SUCCESS);
+        array_map.reset(local_array);
+    }
+
+    ebpf_map_provider_reference_t reference = {0};
+
+    // Reference negatives.
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(nullptr, BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_INVALID_ARGUMENT);
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_CPUMAP, nullptr) ==
+        EBPF_INVALID_ARGUMENT);
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(array_map.get(), BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_INVALID_OBJECT);
+    // Right object, wrong expected type.
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_SAMPLE_HASH_MAP, &reference) ==
+        EBPF_INVALID_OBJECT);
+
+    // A valid reference is required for the activation negatives below.
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_SUCCESS);
+
+    ebpf_map_provider_activate_context_v1_t context = _make_cpumap_activate_context();
+    void* activation_context = nullptr;
+    ebpf_provider_rundown_token_t* token = nullptr;
+
+    // Activate negatives: NULL arguments.
+    REQUIRE(ebpf_map_invoke_provider_activate(nullptr, &context, &activation_context, &token) == EBPF_INVALID_ARGUMENT);
+    REQUIRE(
+        ebpf_map_invoke_provider_activate(&reference, nullptr, &activation_context, &token) == EBPF_INVALID_ARGUMENT);
+    REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, nullptr, &token) == EBPF_INVALID_ARGUMENT);
+    REQUIRE(
+        ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, nullptr) == EBPF_INVALID_ARGUMENT);
+
+    // Activate negative: bad context version.
+    {
+        ebpf_map_provider_activate_context_v1_t bad_context = _make_cpumap_activate_context();
+        bad_context.version = EBPF_MAP_PROVIDER_ACTIVATE_CONTEXT_VERSION_1 + 1;
+        REQUIRE(
+            ebpf_map_invoke_provider_activate(&reference, &bad_context, &activation_context, &token) ==
+            EBPF_INVALID_ARGUMENT);
+        REQUIRE(token == nullptr);
+    }
+
+    // Deactivate with a NULL token must be a no-op (never crash).
+    ebpf_map_invoke_provider_deactivate(&reference, nullptr, nullptr);
+
+    // No activation ever succeeded, so the provider must not have observed any activate/deactivate.
+    REQUIRE(cpumap_provider.activate_count() == 0);
+    REQUIRE(cpumap_provider.deactivate_count() == 0);
+
+    ebpf_map_release_provider_reference(&reference);
+}
+
+TEST_CASE("cpumap_activate_on_v1_provider_not_supported", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    // A version 1 provider (sample hash map) must be rejected for activation: the runtime only activates providers
+    // that publish a version 2 dispatch table with an activate callback. This guards the version 1 backward-compat
+    // path.
+    test_sample_map_provider_t v1_provider;
+    REQUIRE(v1_provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, false) == EBPF_SUCCESS);
+
+    map_ptr sample_map;
+    {
+        ebpf_map_definition_in_memory_t map_definition{
+            BPF_MAP_TYPE_SAMPLE_HASH_MAP, sizeof(uint32_t), sizeof(uint32_t), 4};
+        cxplat_utf8_string_t map_name = {0};
+        ebpf_map_t* local_map = nullptr;
+        REQUIRE(
+            ebpf_map_create(&map_name, &map_definition, (uintptr_t)ebpf_handle_invalid, &local_map) == EBPF_SUCCESS);
+        sample_map.reset(local_map);
+    }
+
+    ebpf_map_provider_reference_t reference = {0};
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(
+            sample_map.get(), BPF_MAP_TYPE_SAMPLE_HASH_MAP, &reference) == EBPF_SUCCESS);
+
+    ebpf_map_provider_activate_context_v1_t context = _make_cpumap_activate_context();
+    void* activation_context = nullptr;
+    ebpf_provider_rundown_token_t* token = nullptr;
+    REQUIRE(
+        ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+    REQUIRE(token == nullptr);
+    REQUIRE(activation_context == nullptr);
+
+    ebpf_map_release_provider_reference(&reference);
+}
+
+TEST_CASE("cpumap_activate_deactivate_lifecycle", "[cpumap]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map());
+
+    ebpf_map_provider_reference_t reference = {0};
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_SUCCESS);
+    REQUIRE(reference.map_type == BPF_MAP_TYPE_CPUMAP);
+    REQUIRE(reference.provider_map_context != nullptr);
+
+    ebpf_map_provider_activate_context_v1_t context = _make_cpumap_activate_context();
+    void* activation_context = nullptr;
+    ebpf_provider_rundown_token_t* token = nullptr;
+    REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) == EBPF_SUCCESS);
+    REQUIRE(token != nullptr);
+    REQUIRE(activation_context != nullptr);
+    REQUIRE(cpumap_provider.activate_count() == 1);
+    REQUIRE(cpumap_provider.deactivate_count() == 0);
+
+    ebpf_map_invoke_provider_deactivate(&reference, activation_context, token);
+    REQUIRE(cpumap_provider.activate_count() == 1);
+    REQUIRE(cpumap_provider.deactivate_count() == 1);
+    // The runtime must round-trip the exact activation-context sentinel back to the deactivate callback.
+    REQUIRE(cpumap_provider.activation_context_roundtrip_ok());
+
+    ebpf_map_release_provider_reference(&reference);
+}
+
+TEST_CASE("cpumap_attach_rollback", "[cpumap]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map());
+
+    ebpf_map_provider_reference_t reference = {0};
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_SUCCESS);
+
+    ebpf_map_provider_activate_context_v1_t context = _make_cpumap_activate_context();
+    void* activation_context = nullptr;
+    ebpf_provider_rundown_token_t* token = nullptr;
+
+    // Provider fails activation. The wrapper must release the rundown reference it acquired and return no token, so no
+    // deactivation is owed. If the rundown reference leaked here, the map teardown below would hang.
+    cpumap_provider.set_activate_should_fail(true);
+    REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) != EBPF_SUCCESS);
+    REQUIRE(token == nullptr);
+    REQUIRE(activation_context == nullptr);
+    REQUIRE(cpumap_provider.activate_count() == 0);
+    REQUIRE(cpumap_provider.deactivate_count() == 0);
+
+    // After the failed attach is rolled back, a subsequent activation on the same reference must succeed, proving the
+    // rundown protection was not left in a broken state.
+    cpumap_provider.set_activate_should_fail(false);
+    REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) == EBPF_SUCCESS);
+    REQUIRE(token != nullptr);
+    REQUIRE(cpumap_provider.activate_count() == 1);
+
+    ebpf_map_invoke_provider_deactivate(&reference, activation_context, token);
+    REQUIRE(cpumap_provider.deactivate_count() == 1);
+
+    ebpf_map_release_provider_reference(&reference);
+}
+
+TEST_CASE("cpumap_rundown_token_held", "[cpumap]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map());
+
+    ebpf_map_provider_reference_t reference = {0};
+    REQUIRE(
+        ebpf_map_try_reference_provider_context_from_helper(cpumap.get(), BPF_MAP_TYPE_CPUMAP, &reference) ==
+        EBPF_SUCCESS);
+
+    ebpf_map_provider_activate_context_v1_t context = _make_cpumap_activate_context();
+    void* activation_context = nullptr;
+    ebpf_provider_rundown_token_t* token = nullptr;
+    REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) == EBPF_SUCCESS);
+    REQUIRE(token != nullptr);
+
+    // Drop the helper object reference; only the local map_ptr keeps the object alive now.
+    ebpf_map_release_provider_reference(&reference);
+
+    // Release the final object reference and kick the epoch so the deferred map free runs. Object teardown is
+    // epoch-deferred and the actual free executes on a background epoch worker: ebpf_custom_map_delete releases the
+    // create-time rundown reference and then blocks in ExWaitForRundownProtectionRelease until the *activation* rundown
+    // reference held by the token is released. Only after that wait completes does the map deregister its NMR client,
+    // which invokes the provider's detach callback. So the detach callback is the observable proof that teardown is
+    // gated on the token's rundown reference (design 17.1 gap 9).
+    std::thread teardown_kicker([&cpumap]() {
+        cpumap.reset();
+        ebpf_epoch_synchronize();
+    });
+
+    // While the token is held, teardown is blocked in the rundown wait, strictly before NMR client deregister, so the
+    // provider can never observe a detach. This holds regardless of scheduling: the worker cannot pass the wait until
+    // the token is released below.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    REQUIRE(cpumap_provider.client_detach_count() == 0);
+    REQUIRE(cpumap_provider.deactivate_count() == 0);
+
+    // Deactivation releases the token's rundown reference, unblocking the pending teardown.
+    ebpf_map_invoke_provider_deactivate(&reference, activation_context, token);
+    REQUIRE(cpumap_provider.deactivate_count() == 1);
+    REQUIRE(cpumap_provider.activation_context_roundtrip_ok());
+
+    teardown_kicker.join();
+
+    // Now that the rundown reference is released, teardown must run to completion and detach the provider's client.
+    for (int i = 0; i < 500 && cpumap_provider.client_detach_count() == 0; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(cpumap_provider.client_detach_count() == 1);
+}
+
+TEST_CASE("cpumap_mutation_admission_and_completion", "[cpumap]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map(sizeof(uint32_t), sizeof(uint32_t), 4));
+
+    uint32_t key = 1;
+    uint32_t value = 100;
+
+    // Successful update: admitted (non-NULL token) and completed exactly once with COMMIT.
+    REQUIRE(
+        ebpf_map_update_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(value), (const uint8_t*)&value, EBPF_ANY, 0) ==
+        EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.mutation_admit_count() == 1);
+    REQUIRE(cpumap_provider.mutation_complete_count() == 1);
+    REQUIRE(cpumap_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_COMMIT);
+
+    // Successful delete of the existing key: admitted and completed once with COMMIT.
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, 0) == EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.mutation_admit_count() == 2);
+    REQUIRE(cpumap_provider.mutation_complete_count() == 2);
+    REQUIRE(cpumap_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_COMMIT);
+
+    // Delete of a now-missing key: still admitted (the gate ran), but the base map operation fails after admission, so
+    // the completion must report ROLLBACK. This proves every admitted mutation drains to exactly one completion.
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, 0) != EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.mutation_admit_count() == 3);
+    REQUIRE(cpumap_provider.mutation_complete_count() == 3);
+    REQUIRE(cpumap_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_ROLLBACK);
+
+    // Every completion callback must have received back the exact sentinel token handed out at admission time.
+    REQUIRE(cpumap_provider.mutation_token_roundtrip_ok());
+}
+
+TEST_CASE("cpumap_active_mutation_rejection", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map(sizeof(uint32_t), sizeof(uint32_t), 4));
+
+    uint32_t key = 7;
+    uint32_t value = 700;
+
+    // Seed one entry while admission is open.
+    REQUIRE(
+        ebpf_map_update_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(value), (const uint8_t*)&value, EBPF_ANY, 0) ==
+        EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.mutation_complete_count() == 1);
+
+    // The provider now closes admission (rejects mutations at the gate). Update and delete must both fail and, because
+    // admission was refused, the base map must be left untouched and NO completion may be issued.
+    cpumap_provider.set_reject_mutation(true);
+    uint32_t admit_before = cpumap_provider.mutation_admit_count();
+    uint32_t complete_before = cpumap_provider.mutation_complete_count();
+
+    uint32_t new_value = 999;
+    REQUIRE(
+        ebpf_map_update_entry(
+            cpumap.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(new_value),
+            (const uint8_t*)&new_value,
+            EBPF_ANY,
+            0) != EBPF_SUCCESS);
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, 0) != EBPF_SUCCESS);
+
+    REQUIRE(cpumap_provider.mutation_admit_count() == admit_before);
+    REQUIRE(cpumap_provider.mutation_complete_count() == complete_before);
+    REQUIRE(cpumap_provider.mutation_reject_count() == 2);
+
+    // The base map must still hold the original value (rejected mutations did not touch it).
+    cpumap_provider.set_reject_mutation(false);
+    uint32_t read_back = 0;
+    REQUIRE(
+        ebpf_map_find_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(read_back), (uint8_t*)&read_back, 0) ==
+        EBPF_SUCCESS);
+    REQUIRE(read_back == value);
+}
+
+TEST_CASE("cpumap_rejectable_delete_v2", "[cpumap]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, false) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map(sizeof(uint32_t), sizeof(uint32_t), 4));
+
+    uint32_t key = 3;
+    uint32_t value = 300;
+    REQUIRE(
+        ebpf_map_update_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(value), (const uint8_t*)&value, EBPF_ANY, 0) ==
+        EBPF_SUCCESS);
+
+    // The provider rejects the version 2 delete. The user delete must fail, the entry must remain, and the admitted
+    // mutation must complete with PROVIDER_REJECT.
+    cpumap_provider.set_reject_delete(true);
+    uint32_t complete_before = cpumap_provider.mutation_complete_count();
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, 0) != EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.mutation_complete_count() == complete_before + 1);
+    REQUIRE(cpumap_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_PROVIDER_REJECT);
+
+    uint32_t read_back = 0;
+    REQUIRE(
+        ebpf_map_find_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(read_back), (uint8_t*)&read_back, 0) ==
+        EBPF_SUCCESS);
+    REQUIRE(read_back == value);
+
+    // With rejection cleared, the delete is accepted and commits.
+    cpumap_provider.set_reject_delete(false);
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, 0) == EBPF_SUCCESS);
+    REQUIRE(cpumap_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_COMMIT);
+}
+
+TEST_CASE("cpumap_bpf_program_crud_rejection", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    // An object map (updates_original_value == true) must reject CRUD attempts that originate from a BPF program (the
+    // EBPF_MAP_FLAG_HELPER path) with EBPF_OPERATION_NOT_SUPPORTED, before any base map access.
+    test_sample_map_provider_t cpumap_provider;
+    REQUIRE(cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, true) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    cpumap.reset(_create_cpumap_map(sizeof(uint32_t), sizeof(uint32_t), 4));
+
+    uint32_t key = 5;
+    uint64_t value = 0;
+
+    REQUIRE(
+        ebpf_map_update_entry(
+            cpumap.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(value),
+            (const uint8_t*)&value,
+            EBPF_ANY,
+            EBPF_MAP_FLAG_HELPER) == EBPF_OPERATION_NOT_SUPPORTED);
+
+    REQUIRE(
+        ebpf_map_find_entry(
+            cpumap.get(), sizeof(key), (const uint8_t*)&key, sizeof(value), (uint8_t*)&value, EBPF_MAP_FLAG_HELPER) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+
+    REQUIRE(
+        ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, EBPF_MAP_FLAG_HELPER) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+
+    // The rejection happens before admission, so the provider must not have admitted or completed any mutation.
+    REQUIRE(cpumap_provider.mutation_admit_count() == 0);
+    REQUIRE(cpumap_provider.mutation_complete_count() == 0);
+}

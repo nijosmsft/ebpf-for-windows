@@ -394,6 +394,213 @@ typedef struct _ebpf_map_provider_dispatch_table
 } ebpf_base_map_provider_dispatch_table_t;
 
 /**
+ * @brief Mutation operation identity carried through the version 2 mutation token/completion callbacks.
+ */
+typedef enum _ebpf_map_mutation_operation_v2
+{
+    EBPF_MAP_MUTATION_OPERATION_UPDATE = 1, ///< The mutation is a map update.
+    EBPF_MAP_MUTATION_OPERATION_DELETE = 2, ///< The mutation is a map delete.
+} ebpf_map_mutation_operation_v2_t;
+
+/**
+ * @brief Reason a version 2 mutation completes. Exactly one completion is delivered for each admitted token.
+ */
+typedef enum _ebpf_map_mutation_completion_v2
+{
+    EBPF_MAP_MUTATION_COMPLETION_COMMIT = 1,          ///< Base map operation succeeded.
+    EBPF_MAP_MUTATION_COMPLETION_ROLLBACK = 2,        ///< Base map operation failed after admission.
+    EBPF_MAP_MUTATION_COMPLETION_PROVIDER_REJECT = 3, ///< Provider rejected after token admission.
+} ebpf_map_mutation_completion_v2_t;
+
+/**
+ * @brief Version 2 mutation admission callback, invoked before any base-map commit attempt.
+ *
+ * The provider admits or rejects the mutation and, on admission, returns an opaque mutation token. The eBPF runtime
+ * guarantees exactly one matching ebpf_postprocess_map_mutation_complete_v2_t call for every non-NULL token returned.
+ *
+ * @param[in] binding_context The binding context provided when the map provider was bound.
+ * @param[in] map_context The eBPF map context.
+ * @param[in] operation The mutation operation being admitted.
+ * @param[in] key_size The size of the key in bytes.
+ * @param[in] key Pointer to the key being mutated.
+ * @param[in] flags Operation flags (see EBPF_MAP_OPERATION_*).
+ * @param[out] mutation_token Receives an opaque provider token on admission, or NULL when no completion is required.
+ *
+ * @retval EBPF_SUCCESS The mutation was admitted.
+ * @retval EBPF_ACCESS_DENIED The map does not currently admit mutations.
+ * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+ *
+ * IRQL: PASSIVE_LEVEL. This callback is never invoked for BPF-program (helper) operations.
+ */
+typedef ebpf_result_t (*ebpf_preprocess_map_mutation_v2_t)(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    ebpf_map_mutation_operation_v2_t operation,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags,
+    _Outptr_result_maybenull_ void** mutation_token);
+
+/**
+ * @brief Version 2 mutation completion callback, invoked exactly once for every non-NULL token returned by
+ * ebpf_preprocess_map_mutation_v2_t.
+ *
+ * @param[in] binding_context The binding context provided when the map provider was bound.
+ * @param[in] map_context The eBPF map context.
+ * @param[in] mutation_token The opaque token returned by ebpf_preprocess_map_mutation_v2_t.
+ * @param[in] operation The mutation operation being completed.
+ * @param[in] completion Whether the base map operation committed, rolled back, or was rejected by the provider.
+ * @param[in] key_size The size of the key in bytes.
+ * @param[in] key Pointer to the key that was mutated.
+ * @param[in] value_size The size in bytes of the provider's stored value buffer, or 0 for delete.
+ * @param[in] value Pointer to the provider's stored value buffer, or NULL for delete.
+ * @param[in] flags Operation flags (see EBPF_MAP_OPERATION_*).
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
+typedef void (*ebpf_postprocess_map_mutation_complete_v2_t)(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_opt_ void* mutation_token,
+    ebpf_map_mutation_operation_v2_t operation,
+    ebpf_map_mutation_completion_v2_t completion,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_opt_(value_size) const uint8_t* value,
+    uint32_t flags);
+
+#define EBPF_MAP_PROVIDER_ACTIVATE_CONTEXT_VERSION_1 1u
+
+/**
+ * @brief Activation context wrapper passed by the eBPF runtime to ebpf_preprocess_map_activate_t.
+ *
+ * provider_attach_context points to the provider-defined activation identity (for CPUMAP, an
+ * XDP_EBPF_CPUMAP_ACTIVATE_CONTEXT_V1).
+ */
+typedef struct _ebpf_map_provider_activate_context_v1
+{
+    uint16_t size;                         ///< Size of this structure in bytes.
+    uint16_t version;                      ///< EBPF_MAP_PROVIDER_ACTIVATE_CONTEXT_VERSION_1.
+    ebpf_program_type_t program_type;      ///< Program type driving the activation.
+    const void* provider_attach_context;   ///< Provider-defined activation identity.
+    uint32_t provider_attach_context_size; ///< Size in bytes of provider_attach_context.
+} ebpf_map_provider_activate_context_v1_t;
+
+/**
+ * @brief Version 2 activation callback, invoked during attach after mutation admission is closed/drained and before
+ * packet data path publication.
+ *
+ * @param[in] binding_context The binding context provided when the map provider was bound.
+ * @param[in] map_context The eBPF map context.
+ * @param[in] context The activation context wrapper.
+ * @param[out] activation_context Receives an opaque provider activation context, passed unchanged to
+ * ebpf_postprocess_map_deactivate_t.
+ *
+ * @retval EBPF_SUCCESS Activation succeeded.
+ * @retval EBPF_INVALID_ARGUMENT Wrong version/size or invalid configuration.
+ * @retval EBPF_OPERATION_NOT_SUPPORTED Unsupported (e.g., native) mode.
+ * @retval EBPF_ACCESS_DENIED The map is not exactly Inactive.
+ * @retval EBPF_NO_MEMORY / EBPF_OUT_OF_SPACE Allocation/quota failure.
+ * @retval EBPF_FAILED Rollback invariant broken.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
+typedef ebpf_result_t (*ebpf_preprocess_map_activate_t)(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_ const ebpf_map_provider_activate_context_v1_t* context,
+    _Outptr_result_maybenull_ void** activation_context);
+
+/**
+ * @brief Version 2 deactivation callback, invoked during detach or rollback in exact reverse activation order.
+ *
+ * @param[in] binding_context The binding context provided when the map provider was bound.
+ * @param[in] map_context The eBPF map context.
+ * @param[in] activation_context The activation context returned by ebpf_preprocess_map_activate_t.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
+typedef void (*ebpf_postprocess_map_deactivate_t)(
+    _In_ void* binding_context, _In_ void* map_context, _In_opt_ void* activation_context);
+
+/**
+ * @brief Version 2 rejectable normal-delete callback. Coexists with postprocess_map_delete_element.
+ *
+ * Invoked only for normal user-initiated deletes: never for EBPF_MAP_OPERATION_HELPER, EBPF_MAP_OPERATION_UPDATE
+ * (replacement), or EBPF_MAP_OPERATION_MAP_CLEANUP. Those keep using postprocess_map_delete_element and must not fail.
+ *
+ * @param[in] binding_context The binding context provided when the map provider was bound.
+ * @param[in] map_context The eBPF map context.
+ * @param[in] key_size The size of the key in bytes.
+ * @param[in] key Pointer to the key to delete.
+ * @param[in] flags Operation flags (see EBPF_MAP_OPERATION_*).
+ *
+ * @retval EBPF_SUCCESS The delete may proceed.
+ * @retval EBPF_ACCESS_DENIED The provider rejects the normal delete.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
+typedef ebpf_result_t (*ebpf_preprocess_map_delete_element_v2_t)(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags);
+
+/**
+ * Version 2 shape of the custom-map provider dispatch table.
+ *
+ * Field ordering is append-only: every version 1 member keeps its order, and the version 2 members are appended after
+ * postprocess_map_delete_element. A version 2 runtime copies min(provider_size, runtime_known_size) as version 1
+ * already does, so a version 1 provider table remains valid and the version 2 tail is treated as NULL. A version 1
+ * runtime does not understand version 2 and fails closed rather than silently activating.
+ */
+typedef struct _ebpf_base_map_provider_dispatch_table_v2
+{
+    ebpf_extension_header_t header;
+    _Notnull_ ebpf_preprocess_map_create_t preprocess_map_create;
+    _Notnull_ ebpf_postprocess_map_delete_t postprocess_map_delete;
+    _Notnull_ ebpf_preprocess_map_associate_program_type_t preprocess_associate_program_type;
+    ebpf_postprocess_map_find_element_t postprocess_map_find_element;
+    ebpf_preprocess_map_update_element_t preprocess_map_update_element;
+#pragma warning(push)
+#pragma warning(disable : 4996) // Suppress deprecation warning for the field declaration itself.
+    ebpf_preprocess_map_delete_element_t preprocess_map_delete_element; ///< Deprecated. Must be NULL in version 2.
+#pragma warning(pop)
+    ebpf_postprocess_map_delete_element_t postprocess_map_delete_element; ///< Preferred non-rejectable cleanup.
+    ebpf_preprocess_map_mutation_v2_t preprocess_map_mutation_v2;
+    ebpf_postprocess_map_mutation_complete_v2_t postprocess_map_mutation_complete_v2;
+    ebpf_preprocess_map_activate_t preprocess_map_activate;
+    ebpf_postprocess_map_deactivate_t postprocess_map_deactivate;
+    ebpf_preprocess_map_delete_element_v2_t preprocess_map_delete_element_v2;
+} ebpf_base_map_provider_dispatch_table_v2_t;
+
+/**
+ * @brief A referenced custom-map provider handle used by trusted kernel extensions.
+ *
+ * Obtained from ebpf_program_reference_maps_by_type or ebpf_map_try_reference_provider_context_from_helper and released
+ * with ebpf_map_release_provider_reference. Holding the reference keeps the map object alive but intentionally does not
+ * expose the provider dispatch table or NMR binding context to the caller.
+ */
+typedef struct _ebpf_map_provider_reference
+{
+    const void* map_object;     ///< Opaque referenced map object.
+    void* provider_map_context; ///< Provider's per-map context.
+    ebpf_map_type_t map_type;   ///< Map type of the referenced map.
+} ebpf_map_provider_reference_t;
+
+/**
+ * @brief Opaque token that pins a custom-map provider's rundown reference for an entire activation lifetime.
+ *
+ * Returned by a successful ebpf_map_invoke_provider_activate call and consumed by the matching
+ * ebpf_map_invoke_provider_deactivate call. While the token is held, the provider cannot complete unregister/unload,
+ * so an activate/deactivate pair can never straddle provider unregister and deactivation can never fail because
+ * rundown already began.
+ */
+typedef struct _ebpf_provider_rundown_token ebpf_provider_rundown_token_t;
+
+/**
  * @brief Allocate memory under epoch control.
  *
  * @param[in] size Size of memory to allocate.

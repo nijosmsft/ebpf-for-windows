@@ -892,8 +892,49 @@ _ebpf_validate_base_map_provider_properties(_In_ const ebpf_base_map_provider_pr
 static bool
 _ebpf_validate_map_provider_dispatch_table(_In_ const ebpf_base_map_provider_dispatch_table_t* dispatch_table)
 {
-    if (dispatch_table == NULL ||
-        !_ebpf_validate_extension_object_header(EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE, &dispatch_table->header)) {
+    if (dispatch_table == NULL) {
+        return false;
+    }
+
+    // Version 2 providers publish an append-only superset of the version 1 table. The generic header validator only
+    // accepts the single registered version (1), so version 2 is validated explicitly here before the version 1 path.
+    // This keeps version 1 validation byte-for-byte identical and fails closed on any unknown version.
+    if (dispatch_table->header.version == EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2) {
+        // The advertised size must cover the entire version 2 table, and total_size must be self-consistent.
+        if (dispatch_table->header.size < EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_SIZE ||
+            dispatch_table->header.total_size < dispatch_table->header.size) {
+            return false;
+        }
+
+        ebpf_base_map_provider_dispatch_table_v2_t local_v2 = {0};
+        memcpy(&local_v2, dispatch_table, min(dispatch_table->header.size, sizeof(local_v2)));
+
+        // Required version 1 base callbacks.
+        if (local_v2.preprocess_map_create == NULL || local_v2.postprocess_map_delete == NULL ||
+            local_v2.preprocess_associate_program_type == NULL) {
+            return false;
+        }
+
+        // Version 2 mandates the preferred non-rejectable cleanup delete and forbids the deprecated preprocess delete.
+        if (local_v2.postprocess_map_delete_element == NULL || local_v2.preprocess_map_delete_element != NULL) {
+            return false;
+        }
+
+        // The mutation token and completion callbacks are a matched pair: a provider must set both or neither, so the
+        // runtime never admits a mutation it cannot complete.
+        if ((local_v2.preprocess_map_mutation_v2 == NULL) != (local_v2.postprocess_map_mutation_complete_v2 == NULL)) {
+            return false;
+        }
+
+        // The activate and deactivate callbacks are a matched pair for the same reason.
+        if ((local_v2.preprocess_map_activate == NULL) != (local_v2.postprocess_map_deactivate == NULL)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if (!_ebpf_validate_extension_object_header(EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE, &dispatch_table->header)) {
         return false;
     }
 

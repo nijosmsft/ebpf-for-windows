@@ -237,6 +237,77 @@ static ebpf_map_provider_data_t _test_sample_hash_map_provider_data = {
     &_test_sample_hash_map_provider_properties,
     &_test_sample_hash_map_dispatch_table};
 
+//
+// Version 2 (CPUMAP) mock map provider. This publishes a version 2 base-map-provider dispatch table that exercises the
+// mutation token/completion, activation/deactivation, and rejectable-delete callbacks added in increment 1. The base
+// CRUD callbacks are shared with the sample hash map provider above.
+//
+static ebpf_result_t
+_test_cpumap_preprocess_mutation_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    ebpf_map_mutation_operation_v2_t operation,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags,
+    _Outptr_result_maybenull_ void** mutation_token);
+
+static void
+_test_cpumap_postprocess_mutation_complete_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_opt_ void* mutation_token,
+    ebpf_map_mutation_operation_v2_t operation,
+    ebpf_map_mutation_completion_v2_t completion,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_opt_(value_size) const uint8_t* value,
+    uint32_t flags);
+
+static ebpf_result_t
+_test_cpumap_preprocess_map_activate(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_ const ebpf_map_provider_activate_context_v1_t* context,
+    _Outptr_result_maybenull_ void** activation_context);
+
+static void
+_test_cpumap_postprocess_map_deactivate(
+    _In_ void* binding_context, _In_ void* map_context, _In_opt_ void* activation_context);
+
+static ebpf_result_t
+_test_cpumap_preprocess_map_delete_element_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags);
+
+static ebpf_base_map_provider_dispatch_table_v2_t _test_cpumap_hash_map_dispatch_table_v2 = {
+    .header = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_HEADER,
+    .preprocess_map_create = _test_sample_hash_map_create,
+    .postprocess_map_delete = _test_sample_hash_map_delete,
+    .preprocess_associate_program_type = _test_sample_map_associate_program,
+    .postprocess_map_find_element = _test_sample_hash_map_find_entry,
+    .preprocess_map_update_element = _test_sample_hash_map_update_entry,
+    .postprocess_map_delete_element = _test_sample_hash_map_delete_entry,
+    .preprocess_map_mutation_v2 = _test_cpumap_preprocess_mutation_v2,
+    .postprocess_map_mutation_complete_v2 = _test_cpumap_postprocess_mutation_complete_v2,
+    .preprocess_map_activate = _test_cpumap_preprocess_map_activate,
+    .postprocess_map_deactivate = _test_cpumap_postprocess_map_deactivate,
+    .preprocess_map_delete_element_v2 = _test_cpumap_preprocess_map_delete_element_v2};
+
+static ebpf_base_map_provider_properties_t _test_cpumap_hash_map_provider_properties = {
+    EBPF_BASE_MAP_PROVIDER_PROPERTIES_HEADER, true};
+
+static ebpf_map_provider_data_t _test_cpumap_provider_data = {
+    EBPF_MAP_PROVIDER_DATA_HEADER,
+    BPF_MAP_TYPE_CPUMAP,
+    BPF_MAP_TYPE_HASH,
+    &_test_cpumap_hash_map_provider_properties,
+    (ebpf_base_map_provider_dispatch_table_t*)&_test_cpumap_hash_map_dispatch_table_v2};
+
 typedef class _test_sample_map_provider
 {
     // Map provider implementation
@@ -259,6 +330,18 @@ typedef class _test_sample_map_provider
     initialize(uint32_t map_type, bool object_map, bool register_crud_apis = true, bool use_postprocess_delete = true)
     {
         _object_map = object_map;
+
+        // CPUMAP uses the version 2 dispatch table. register_crud_apis / use_postprocess_delete do not apply.
+        if (map_type == BPF_MAP_TYPE_CPUMAP) {
+            UNREFERENCED_PARAMETER(register_crud_apis);
+            UNREFERENCED_PARAMETER(use_postprocess_delete);
+            _test_cpumap_provider_data.base_properties->updates_original_value = object_map ? true : false;
+            _map_provider_characteristics.ProviderRegistrationInstance.NpiSpecificCharacteristics =
+                &_test_cpumap_provider_data;
+            NTSTATUS cpumap_status = NmrRegisterProvider(&_map_provider_characteristics, this, &_map_provider_handle);
+            return NT_SUCCESS(cpumap_status) ? EBPF_SUCCESS : EBPF_FAILED;
+        }
+
         if (map_type == BPF_MAP_TYPE_SAMPLE_HASH_MAP || map_type == BPF_MAP_TYPE_SAMPLE_HASH_MAP_UNREGISTERED) {
             _map_provider_characteristics.ProviderRegistrationInstance.NpiSpecificCharacteristics =
                 &_test_sample_hash_map_provider_data;
@@ -341,7 +424,10 @@ typedef class _test_sample_map_provider
     static NTSTATUS
     _map_provider_detach_client(_In_ const void* provider_binding_context)
     {
-        UNREFERENCED_PARAMETER(provider_binding_context);
+        if (provider_binding_context != nullptr) {
+            test_sample_map_provider_t* provider = (test_sample_map_provider_t*)provider_binding_context;
+            provider->note_client_detach();
+        }
         return STATUS_SUCCESS;
     }
 
@@ -381,6 +467,131 @@ typedef class _test_sample_map_provider
         return _object_map;
     }
 
+    // Version 2 (CPUMAP) test controls and observation counters. These are toggled by tests and updated by the
+    // version 2 callbacks (which receive this provider instance as their binding context).
+    void
+    set_reject_mutation(bool value)
+    {
+        _reject_mutation = value;
+    }
+    void
+    set_reject_delete(bool value)
+    {
+        _reject_delete = value;
+    }
+    void
+    set_activate_should_fail(bool value)
+    {
+        _activate_should_fail = value;
+    }
+    bool
+    reject_mutation() const
+    {
+        return _reject_mutation;
+    }
+    bool
+    reject_delete() const
+    {
+        return _reject_delete;
+    }
+    bool
+    activate_should_fail() const
+    {
+        return _activate_should_fail;
+    }
+    void
+    note_mutation_admit()
+    {
+        _mutation_admit_count++;
+    }
+    void
+    note_mutation_reject()
+    {
+        _mutation_reject_count++;
+    }
+    void
+    note_mutation_complete(ebpf_map_mutation_completion_v2_t completion)
+    {
+        _mutation_complete_count++;
+        _last_completion = completion;
+    }
+    void
+    note_activate()
+    {
+        _activate_count++;
+    }
+    void
+    note_deactivate()
+    {
+        _deactivate_count++;
+    }
+    void
+    note_mutation_token_roundtrip(bool matched)
+    {
+        if (!matched) {
+            _mutation_token_mismatch = true;
+        }
+    }
+    void
+    note_activation_context_roundtrip(bool matched)
+    {
+        if (!matched) {
+            _activation_context_mismatch = true;
+        }
+    }
+    // Called from the map-teardown path (NMR client deregister), which runs only after the provider rundown wait in
+    // ebpf_custom_map_delete completes. May run on a background epoch worker thread, so it is interlocked.
+    void
+    note_client_detach()
+    {
+        InterlockedIncrement(&_client_detach_count);
+    }
+    uint32_t
+    mutation_admit_count() const
+    {
+        return _mutation_admit_count;
+    }
+    uint32_t
+    mutation_reject_count() const
+    {
+        return _mutation_reject_count;
+    }
+    uint32_t
+    mutation_complete_count() const
+    {
+        return _mutation_complete_count;
+    }
+    uint32_t
+    activate_count() const
+    {
+        return _activate_count;
+    }
+    uint32_t
+    deactivate_count() const
+    {
+        return _deactivate_count;
+    }
+    ebpf_map_mutation_completion_v2_t
+    last_completion() const
+    {
+        return _last_completion;
+    }
+    bool
+    mutation_token_roundtrip_ok() const
+    {
+        return !_mutation_token_mismatch;
+    }
+    bool
+    activation_context_roundtrip_ok() const
+    {
+        return !_activation_context_mismatch;
+    }
+    uint32_t
+    client_detach_count() const
+    {
+        return (uint32_t)InterlockedCompareExchange(&_client_detach_count, 0, 0);
+    }
+
     // NMR Provider infrastructure
   private:
     HANDLE _map_provider_handle = INVALID_HANDLE_VALUE;
@@ -397,6 +608,20 @@ typedef class _test_sample_map_provider
 
     static uint64_t _map_context_offset;
     bool _object_map = false;
+
+    // Version 2 (CPUMAP) test state.
+    bool _reject_mutation = false;
+    bool _reject_delete = false;
+    bool _activate_should_fail = false;
+    uint32_t _mutation_admit_count = 0;
+    uint32_t _mutation_reject_count = 0;
+    uint32_t _mutation_complete_count = 0;
+    uint32_t _activate_count = 0;
+    uint32_t _deactivate_count = 0;
+    bool _mutation_token_mismatch = false;
+    bool _activation_context_mismatch = false;
+    mutable volatile long _client_detach_count = 0;
+    ebpf_map_mutation_completion_v2_t _last_completion = (ebpf_map_mutation_completion_v2_t)0;
 } test_sample_map_provider_t;
 
 // Definition of the static member variable - inline to avoid multiple definition errors.
@@ -516,6 +741,112 @@ _test_sample_hash_map_preprocess_delete_entry(
     return EBPF_SUCCESS;
 }
 #pragma warning(pop)
+
+//
+// Version 2 (CPUMAP) callback bodies. The binding context is the test_sample_map_provider_t instance (published via
+// _map_provider_attach_client). The mutation token and activation context are non-NULL sentinels (the provider
+// instance pointer) so the runtime's "token held" contract is exercised without a real provider object.
+//
+static ebpf_result_t
+_test_cpumap_preprocess_mutation_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    ebpf_map_mutation_operation_v2_t operation,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags,
+    _Outptr_result_maybenull_ void** mutation_token)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(operation);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+    *mutation_token = nullptr;
+    if (provider->reject_mutation()) {
+        provider->note_mutation_reject();
+        return EBPF_ACCESS_DENIED;
+    }
+    provider->note_mutation_admit();
+    // Non-NULL sentinel token: the runtime must hand this exact value back to the completion callback.
+    *mutation_token = binding_context;
+    return EBPF_SUCCESS;
+}
+
+static void
+_test_cpumap_postprocess_mutation_complete_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_opt_ void* mutation_token,
+    ebpf_map_mutation_operation_v2_t operation,
+    ebpf_map_mutation_completion_v2_t completion,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_opt_(value_size) const uint8_t* value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(operation);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(value_size);
+    UNREFERENCED_PARAMETER(value);
+    UNREFERENCED_PARAMETER(flags);
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+    // The runtime must return the exact sentinel token supplied at admission time.
+    provider->note_mutation_token_roundtrip(mutation_token == binding_context);
+    provider->note_mutation_complete(completion);
+}
+
+static ebpf_result_t
+_test_cpumap_preprocess_map_activate(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    _In_ const ebpf_map_provider_activate_context_v1_t* context,
+    _Outptr_result_maybenull_ void** activation_context)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(context);
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+    *activation_context = nullptr;
+    if (provider->activate_should_fail()) {
+        return EBPF_NO_MEMORY;
+    }
+    provider->note_activate();
+    *activation_context = binding_context;
+    return EBPF_SUCCESS;
+}
+
+static void
+_test_cpumap_postprocess_map_deactivate(
+    _In_ void* binding_context, _In_ void* map_context, _In_opt_ void* activation_context)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+    provider->note_activation_context_roundtrip(activation_context == binding_context);
+    provider->note_deactivate();
+}
+
+static ebpf_result_t
+_test_cpumap_preprocess_map_delete_element_v2(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+    if (provider->reject_delete()) {
+        return EBPF_ACCESS_DENIED;
+    }
+    return EBPF_SUCCESS;
+}
 
 // XDP program information.
 static const ebpf_context_descriptor_t _ebpf_xdp_test_context_descriptor = {
