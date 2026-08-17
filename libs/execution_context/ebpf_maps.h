@@ -6,6 +6,7 @@
 #include "bpf_helpers.h"
 #include "cxplat.h"
 #include "ebpf_core_structs.h"
+#include "ebpf_extension.h"
 #include "ebpf_platform.h"
 
 #ifdef __cplusplus
@@ -468,6 +469,97 @@ extern "C"
      */
     _Must_inspect_result_ ebpf_result_t
     ebpf_map_get_value_address(_In_ const ebpf_map_t* map, _Out_ uintptr_t* value_address);
+
+    /**
+     * @brief Reference every associated map of a given type for an eBPF program.
+     *
+     * Attach-time API used by trusted kernel extensions (for example, XDP) to obtain references to the custom maps of a
+     * given type associated with a program, without ever exposing the provider dispatch table or NMR binding context.
+     * Each returned reference must be released with ebpf_map_release_provider_reference.
+     *
+     * @param[in] program_binding_context The eBPF program binding context supplied to the hook provider at attach.
+     * @param[in] map_type The map type to match.
+     * @param[out] maps Caller buffer receiving the references, or NULL to query the required count.
+     * @param[in,out] map_count On input, the capacity of @p maps. On output, the number of matching maps.
+     * @retval EBPF_SUCCESS All matching maps were referenced.
+     * @retval EBPF_INSUFFICIENT_BUFFER @p maps was NULL or too small; @p map_count holds the required count.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+     * @retval EBPF_INVALID_OBJECT The program or a matching map is not valid.
+     * @retval EBPF_KEY_NOT_FOUND No map of the requested type is associated.
+     */
+    _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_program_reference_maps_by_type(
+        _In_ const void* program_binding_context,
+        ebpf_map_type_t map_type,
+        _Out_writes_to_opt_(*map_count, *map_count) ebpf_map_provider_reference_t* maps,
+        _Inout_ uint32_t* map_count);
+
+    /**
+     * @brief Release a single provider reference.
+     *
+     * @param[in] map_reference A reference returned by ebpf_program_reference_maps_by_type or
+     * ebpf_map_try_reference_provider_context_from_helper. Never calls provider callbacks and never waits.
+     */
+    _IRQL_requires_max_(DISPATCH_LEVEL) void ebpf_map_release_provider_reference(
+        _In_ const ebpf_map_provider_reference_t* map_reference);
+
+    /**
+     * @brief Try to reference a custom-map provider context from a helper map argument.
+     *
+     * DISPATCH_LEVEL-safe. Validates the helper map argument, requires @p expected_map_type, and only increments an
+     * existing nonzero object reference. Never waits, allocates, or calls provider callbacks.
+     *
+     * @param[in] helper_map_argument The map argument as passed to an eBPF helper (an ebpf_map_t*).
+     * @param[in] expected_map_type The map type the caller requires.
+     * @param[out] map_reference Receives the reference on success.
+     * @retval EBPF_SUCCESS The reference was acquired.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+     * @retval EBPF_INVALID_OBJECT The argument is not a live custom map of the expected type.
+     */
+    _IRQL_requires_max_(DISPATCH_LEVEL) _Must_inspect_result_ ebpf_result_t
+        ebpf_map_try_reference_provider_context_from_helper(
+            _In_ const void* helper_map_argument,
+            ebpf_map_type_t expected_map_type,
+            _Out_ ebpf_map_provider_reference_t* map_reference);
+
+    /**
+     * @brief Activate a custom-map provider, pinning its rundown reference for the activation lifetime.
+     *
+     * PASSIVE_LEVEL attach-only. Verifies a version 2 dispatch table with preprocess_map_activate, acquires the
+     * provider rundown reference, invokes the provider activate callback, and on success returns a rundown token that
+     * continues to hold the acquired rundown reference. The rundown reference is released inside the wrapper only when
+     * the provider callback fails, in which case no token is returned.
+     *
+     * @param[in] map_reference A live reference to the map to activate.
+     * @param[in] context The activation context wrapper.
+     * @param[out] activation_context Receives the provider activation context for the matching deactivate call.
+     * @param[out] rundown_token Receives the rundown token on success.
+     * @retval EBPF_SUCCESS Activation succeeded.
+     * @retval EBPF_INVALID_ARGUMENT Bad arguments or wrong context size/version.
+     * @retval EBPF_INVALID_OBJECT Stale or non-custom reference.
+     * @retval EBPF_OPERATION_NOT_SUPPORTED The provider does not support version 2 activation.
+     * @retval EBPF_EXTENSION_FAILED_TO_LOAD Provider rundown could not be acquired.
+     */
+    _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_map_invoke_provider_activate(
+        _In_ const ebpf_map_provider_reference_t* map_reference,
+        _In_ const ebpf_map_provider_activate_context_v1_t* context,
+        _Outptr_result_maybenull_ void** activation_context,
+        _Outptr_ ebpf_provider_rundown_token_t** rundown_token);
+
+    /**
+     * @brief Deactivate a custom-map provider and release the rundown reference held by its token.
+     *
+     * PASSIVE_LEVEL detach/rollback-only. Uses the dispatch pointer, binding context, and provider map context pinned
+     * by @p rundown_token, invokes the provider deactivate callback, then releases the provider rundown reference held
+     * by the token, invalidating it. Void because detach, rollback, and final cleanup must always reach a safe state.
+     *
+     * @param[in] map_reference The reference used for the matching activation.
+     * @param[in] activation_context The activation context returned by ebpf_map_invoke_provider_activate.
+     * @param[in] rundown_token The token returned by ebpf_map_invoke_provider_activate. Consumed exactly once.
+     */
+    _IRQL_requires_max_(PASSIVE_LEVEL) void ebpf_map_invoke_provider_deactivate(
+        _In_ const ebpf_map_provider_reference_t* map_reference,
+        _In_opt_ void* activation_context,
+        _In_ _Post_invalid_ ebpf_provider_rundown_token_t* rundown_token);
 
 #ifdef __cplusplus
 }

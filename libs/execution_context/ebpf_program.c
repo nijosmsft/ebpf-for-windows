@@ -11,6 +11,7 @@
 #include "ebpf_extension_uuids.h"
 #include "ebpf_handle.h"
 #include "ebpf_link.h"
+#include "ebpf_maps.h"
 #include "ebpf_native.h"
 #include "ebpf_object.h"
 #include "ebpf_program.h"
@@ -1664,6 +1665,80 @@ ebpf_program_associate_maps(ebpf_program_t* program, ebpf_map_t** maps, uint32_t
 Done:
     ebpf_free(program_maps);
 
+    EBPF_RETURN_RESULT(result);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_program_reference_maps_by_type(
+    _In_ const void* program_binding_context,
+    ebpf_map_type_t map_type,
+    _Out_writes_to_opt_(*map_count, *map_count) ebpf_map_provider_reference_t* maps,
+    _Inout_ uint32_t* map_count)
+{
+    EBPF_LOG_ENTRY();
+    if (program_binding_context == NULL || map_count == NULL) {
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+    }
+
+    // The binding context handed to a base-map provider at attach time is the ebpf_link_t* that the
+    // hook (e.g. XDP) registered as its NMR client context (see ebpf_link.c NmrClientAttachProvider,
+    // and design section 8.2). Resolve the owning program from the link under link synchronization and
+    // hold a reference on it across the enumeration so it cannot be detached and freed underneath us.
+    ebpf_core_object_t* object = (ebpf_core_object_t*)program_binding_context;
+    if (object->type != EBPF_OBJECT_LINK) {
+        EBPF_RETURN_RESULT(EBPF_INVALID_OBJECT);
+    }
+
+    ebpf_program_t* program = NULL;
+    ebpf_result_t result = ebpf_link_reference_program((ebpf_link_t*)program_binding_context, &program);
+    if (result != EBPF_SUCCESS) {
+        EBPF_RETURN_RESULT(result);
+    }
+
+    uint32_t capacity = *map_count;
+    uint32_t matched = 0;
+    uint32_t filled = 0;
+
+    ebpf_lock_state_t state = ebpf_lock_lock(&program->lock);
+
+    for (uint32_t i = 0; i < program->count_of_maps; i++) {
+        const ebpf_map_definition_in_memory_t* definition = ebpf_map_get_definition(program->maps[i]);
+        if (definition != NULL && (ebpf_map_type_t)definition->type == map_type) {
+            matched++;
+        }
+    }
+
+    if (matched == 0) {
+        result = EBPF_KEY_NOT_FOUND;
+        goto Done;
+    }
+
+    if (maps == NULL || capacity < matched) {
+        result = EBPF_INSUFFICIENT_BUFFER;
+        goto Done;
+    }
+
+    for (uint32_t i = 0; i < program->count_of_maps && filled < matched; i++) {
+        ebpf_map_t* map = program->maps[i];
+        const ebpf_map_definition_in_memory_t* definition = ebpf_map_get_definition(map);
+        if (definition == NULL || (ebpf_map_type_t)definition->type != map_type) {
+            continue;
+        }
+        result = ebpf_map_try_reference_provider_context_from_helper((const void*)map, map_type, &maps[filled]);
+        if (result != EBPF_SUCCESS) {
+            // Roll back the references already taken so the caller owns none on failure.
+            for (uint32_t j = 0; j < filled; j++) {
+                ebpf_map_release_provider_reference(&maps[j]);
+            }
+            result = EBPF_INVALID_OBJECT;
+            goto Done;
+        }
+        filled++;
+    }
+
+Done:
+    ebpf_lock_unlock(&program->lock, state);
+    EBPF_OBJECT_RELEASE_REFERENCE((ebpf_core_object_t*)program);
+    *map_count = matched;
     EBPF_RETURN_RESULT(result);
 }
 
