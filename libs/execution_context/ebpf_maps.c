@@ -4543,6 +4543,60 @@ _ebpf_custom_map_provider_dispatch_v2(_In_ const ebpf_custom_map_t* custom_map)
     return NULL;
 }
 
+/**
+ * @brief Enforce the CPUMAP-specific provider contract (design section 17.2).
+ *
+ * Generic dispatch-table validation (shared_common.c) only checks that a version 2 table is internally consistent and
+ * that its matched callback pairs are all-or-nothing. CPUMAP is stricter: it can only be backed by a fully-populated
+ * version 2 provider that opts into updates_original_value. Enforcing this at attach time guarantees that a version 1,
+ * partial-version-2, or updates_original_value == FALSE provider can never back a CPUMAP, which in turn guarantees the
+ * runtime rejects BPF-program/helper CRUD before any PASSIVE-only provider mutation callback could be reached at
+ * DISPATCH_LEVEL, and that the mutation/activation/rejectable-delete gates the runtime depends on actually exist.
+ *
+ * @param[in] dispatch The provider dispatch table copied at attach time.
+ * @param[in] provider_flags The custom map's provider flags (carries updates_original_value).
+ * @retval true The provider satisfies every locked CPUMAP requirement.
+ * @retval false The provider must be rejected for a CPUMAP.
+ */
+static bool
+_ebpf_validate_cpumap_provider_requirements(
+    _In_ const ebpf_base_map_provider_dispatch_table_t* dispatch, uint32_t provider_flags)
+{
+    // Require a version 2 dispatch table large enough to address the full version 2 tail.
+    if (dispatch == NULL || dispatch->header.version < EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2 ||
+        dispatch->header.size < EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_SIZE) {
+        return false;
+    }
+
+    const ebpf_base_map_provider_dispatch_table_v2_t* v2 = (const ebpf_base_map_provider_dispatch_table_v2_t*)dispatch;
+
+    // updates_original_value == TRUE is a LOCKED requirement (item 9). It forces BPF-program lookup/update/delete to be
+    // rejected at DISPATCH_LEVEL, so the PASSIVE-only mutation callbacks below are unreachable from a helper.
+    if (!UPDATE_ORIGINAL_VALUE_FLAG_PRESENT(provider_flags)) {
+        return false;
+    }
+
+    // Every locked version 2 callback must be present (item 4).
+    if (v2->preprocess_map_mutation_v2 == NULL || v2->postprocess_map_mutation_complete_v2 == NULL ||
+        v2->preprocess_map_activate == NULL || v2->postprocess_map_deactivate == NULL ||
+        v2->preprocess_map_delete_element_v2 == NULL) {
+        return false;
+    }
+
+    // Non-rejectable post-delete required; the deprecated rejectable pre-delete slot must be NULL (item 8).
+    if (v2->postprocess_map_delete_element == NULL || v2->preprocess_map_delete_element != NULL) {
+        return false;
+    }
+
+    // updates_original_value also requires find and update callbacks so the base map never inspects/mutates the entry
+    // itself; these back the reject-at-DISPATCH gate above.
+    if (v2->postprocess_map_find_element == NULL || v2->preprocess_map_update_element == NULL) {
+        return false;
+    }
+
+    return true;
+}
+
 static ebpf_map_client_data_t _ebpf_custom_map_client_data = {
     EBPF_MAP_CLIENT_DATA_HEADER,
     offsetof(ebpf_custom_map_t, core_map) + offsetof(ebpf_core_map_t, custom_map_context),
@@ -4631,6 +4685,57 @@ _clean_up_custom_hash_map(_Inout_ ebpf_custom_map_t* map)
 {
 
     ebpf_core_map_t* core_map = &map->core_map;
+
+    if (_ebpf_custom_map_provider_dispatch_v2(map) != NULL) {
+        // Version 2 post-removal contract (design section 8.5): the provider's post-delete callback must run AFTER the
+        // element has left the base map and OUTSIDE the map lock, so a provider such as CPUMAP can acquire its own
+        // push lock during cleanup without risking a lock-order inversion or a bugcheck. Snapshot each element, remove
+        // it under the lock (the hash-table's own free notification is suppressed via a NULL operation context), then
+        // notify the provider once the lock is dropped.
+        uint32_t key_size = core_map->ebpf_map_definition.key_size;
+        size_t value_size = map->actual_value_size;
+        uint8_t* key_copy = (uint8_t*)ebpf_allocate_with_tag(key_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        uint8_t* value_copy = (uint8_t*)ebpf_allocate_with_tag(value_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        for (;;) {
+            ebpf_lock_state_t lock_state = ebpf_lock_lock(&map->lock);
+            uint8_t* first_key = NULL;
+            uint8_t* value = NULL;
+            ebpf_result_t result = ebpf_hash_table_next_key_pointer_and_value(
+                (ebpf_hash_table_t*)core_map->data, NULL, &first_key, &value);
+            if (result != EBPF_SUCCESS) {
+                ebpf_lock_unlock(&map->lock, lock_state);
+                break;
+            }
+            bool notify = false;
+            if (key_copy != NULL && value_copy != NULL && HAS_DELETE_ELEMENT_CALLBACK(map->provider_dispatch)) {
+                memcpy(key_copy, first_key, key_size);
+                memcpy(value_copy, value, value_size);
+                notify = true;
+            }
+            ebpf_assert_success(ebpf_hash_table_delete((ebpf_hash_table_t*)core_map->data, NULL, first_key));
+            ebpf_lock_unlock(&map->lock, lock_state);
+
+            if (notify) {
+                // Post-removal, outside the map lock.
+                _invoke_delete_element_callback(
+                    map->provider_dispatch,
+                    map->provider_context,
+                    core_map->custom_map_context,
+                    key_size,
+                    key_copy,
+                    value_size,
+                    value_copy,
+                    EBPF_MAP_OPERATION_MAP_CLEANUP);
+            }
+        }
+        ebpf_assert(ebpf_hash_table_key_count((ebpf_hash_table_t*)core_map->data) == 0);
+        ebpf_free(key_copy);
+        ebpf_free(value_copy);
+        return;
+    }
+
+    // Version 1 behavior (unchanged): notify under the lock, before removal, using the delete-previous-key iterator
+    // pattern so the notification still sees a valid value pointer.
     ebpf_lock_state_t lock_state = ebpf_lock_lock(&map->lock);
 
     uint8_t* previous_key = NULL;
@@ -5008,7 +5113,14 @@ ebpf_custom_map_create(
         }
     }
 
-    bool pre_free_notification_supported = custom_map->provider_dispatch->preprocess_map_update_element != NULL;
+    // Version 1 providers keep their historical behavior: when they expose an update-element callback the hash map
+    // fires the delete notification via the PRE_FREE hook, which runs under the bucket lock before the element is
+    // removed. Version 2 providers (e.g. CPUMAP) must instead receive the post-delete notification AFTER the element
+    // is removed and never under a base-map spin lock (design section 8.5, post-removal PASSIVE contract), so they use
+    // the post-removal FREE notification. This preserves v1 behavior exactly while giving v2 the locked contract.
+    bool provider_is_v2 = _ebpf_custom_map_provider_dispatch_v2(custom_map) != NULL;
+    bool pre_free_notification_supported =
+        !provider_is_v2 && custom_map->provider_dispatch->preprocess_map_update_element != NULL;
 
     // Create hash map.
     result = _ebpf_custom_map_create_hash_map(
@@ -5152,6 +5264,21 @@ _ebpf_custom_map_client_attach_provider(
         provider_dispatch_table,
         provider_data->base_provider_table,
         min(sizeof(ebpf_base_map_provider_dispatch_table_v2_t), provider_data->base_provider_table->header.size));
+
+    // CPUMAP has locked provider requirements (design section 17.2). Enforce them before the dispatch table is
+    // published so that a version 1, partially-populated version 2, or updates_original_value == FALSE provider can
+    // never back a CPUMAP; otherwise helper CRUD could reach PASSIVE-only mutation callbacks at DISPATCH_LEVEL and the
+    // provider push-lock / allocation paths could bugcheck or corrupt state.
+    if ((ebpf_map_type_t)custom_map->core_map.ebpf_map_definition.type == BPF_MAP_TYPE_CPUMAP &&
+        !_ebpf_validate_cpumap_provider_requirements(provider_dispatch_table, custom_map->provider_flags)) {
+        EBPF_LOG_MESSAGE(
+            EBPF_TRACELOG_LEVEL_ERROR,
+            EBPF_TRACELOG_KEYWORD_MAP,
+            "CPUMAP provider does not satisfy the required version 2 contract");
+        status = STATUS_NOT_SUPPORTED;
+        goto Done;
+    }
+
     custom_map->provider_dispatch = provider_dispatch_table;
     provider_dispatch_table = NULL;
 
@@ -5641,5 +5768,30 @@ _IRQL_requires_max_(PASSIVE_LEVEL) void ebpf_map_invoke_provider_deactivate(
     // Release the provider rundown reference held since activation, invalidating the token.
     ExReleaseRundownProtection(&token->custom_map->provider_rundown_reference);
     ebpf_free(token);
+}
+
+// Test-only observability seam (no production/kernel caller). Reports whether the custom-map provider rundown has
+// entered the run-down (waiting) state, i.e. a thread is blocked in ExWaitForRundownProtectionRelease on this map's
+// provider rundown reference and new acquisitions are being refused. Implemented as a net-zero probe: if acquisition
+// succeeds the rundown has not started, so it is released immediately and the map reports inactive; if acquisition
+// fails the rundown wait is in progress. Unit tests use this to build a deterministic barrier proving that provider
+// unregister is blocked until the activation token releases the rundown reference (design section 17.1 gap 9). This
+// has no effect on any production code path because nothing outside the tests calls it.
+_IRQL_requires_max_(PASSIVE_LEVEL) bool ebpf_map_provider_rundown_is_active(
+    _In_ const ebpf_map_provider_reference_t* map_reference)
+{
+    if (map_reference == NULL) {
+        return false;
+    }
+    ebpf_custom_map_t* custom_map = NULL;
+    if (_ebpf_resolve_custom_map_of_type(map_reference->map_object, map_reference->map_type, &custom_map) !=
+        EBPF_SUCCESS) {
+        return false;
+    }
+    if (ExAcquireRundownProtection(&custom_map->provider_rundown_reference)) {
+        ExReleaseRundownProtection(&custom_map->provider_rundown_reference);
+        return false;
+    }
+    return true;
 }
 #pragma endregion

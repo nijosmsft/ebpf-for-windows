@@ -1679,18 +1679,24 @@ _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_prog
         EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
     }
 
-    // For increment 1 the program binding context is the ebpf_program_t*. The mapping from the hook/link binding
-    // context XDP receives at attach to the owning program is resolved by the hook integration in a later increment
-    // (see design section 8.2). Validate the object type defensively before dereferencing program internals.
-    ebpf_program_t* program = (ebpf_program_t*)program_binding_context;
-    if (program->object.type != EBPF_OBJECT_PROGRAM) {
+    // The binding context handed to a base-map provider at attach time is the ebpf_link_t* that the
+    // hook (e.g. XDP) registered as its NMR client context (see ebpf_link.c NmrClientAttachProvider,
+    // and design section 8.2). Resolve the owning program from the link under link synchronization and
+    // hold a reference on it across the enumeration so it cannot be detached and freed underneath us.
+    ebpf_core_object_t* object = (ebpf_core_object_t*)program_binding_context;
+    if (object->type != EBPF_OBJECT_LINK) {
         EBPF_RETURN_RESULT(EBPF_INVALID_OBJECT);
+    }
+
+    ebpf_program_t* program = NULL;
+    ebpf_result_t result = ebpf_link_reference_program((ebpf_link_t*)program_binding_context, &program);
+    if (result != EBPF_SUCCESS) {
+        EBPF_RETURN_RESULT(result);
     }
 
     uint32_t capacity = *map_count;
     uint32_t matched = 0;
     uint32_t filled = 0;
-    ebpf_result_t result = EBPF_SUCCESS;
 
     ebpf_lock_state_t state = ebpf_lock_lock(&program->lock);
 
@@ -1731,6 +1737,7 @@ _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_prog
 
 Done:
     ebpf_lock_unlock(&program->lock, state);
+    EBPF_OBJECT_RELEASE_REFERENCE((ebpf_core_object_t*)program);
     *map_count = matched;
     EBPF_RETURN_RESULT(result);
 }

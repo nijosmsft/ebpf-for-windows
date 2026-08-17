@@ -29,6 +29,7 @@ typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
 #pragma warning(disable : 4324) // structure was padded due to alignment specifier
 #include <ndis/nbl.h>
 #endif
+#include <algorithm>
 #include <ifdef.h>
 #include <vector>
 
@@ -284,14 +285,65 @@ _test_cpumap_preprocess_map_delete_element_v2(
     _In_reads_opt_(key_size) const uint8_t* key,
     uint32_t flags);
 
+// Dedicated CPUMAP base-CRUD callbacks. Unlike the sample "object map" callbacks, these do PLAIN value passthrough
+// while still reporting updates_original_value == TRUE (the design section 17.2 locked requirement). This keeps the
+// CPUMAP mock design-compliant (helper CRUD is rejected, PASSIVE mutation gate is exercised) without imposing eBPF
+// object-reference value semantics that CPUMAP does not use.
+static ebpf_result_t
+_test_cpumap_map_create(
+    _In_ void* binding_context,
+    uint32_t map_type,
+    uint32_t key_size,
+    uint32_t value_size,
+    uint32_t max_entries,
+    _Out_ uint32_t* actual_value_size,
+    _Outptr_ void** map_context);
+
+static void
+_test_cpumap_map_delete(_In_ void* binding_context, _In_ _Post_invalid_ void* map_context);
+
+static ebpf_result_t
+_test_cpumap_find_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags);
+
+static ebpf_result_t
+_test_cpumap_update_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags);
+
+static void
+_test_cpumap_postprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags);
+
 static ebpf_base_map_provider_dispatch_table_v2_t _test_cpumap_hash_map_dispatch_table_v2 = {
     .header = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_HEADER,
-    .preprocess_map_create = _test_sample_hash_map_create,
-    .postprocess_map_delete = _test_sample_hash_map_delete,
+    .preprocess_map_create = _test_cpumap_map_create,
+    .postprocess_map_delete = _test_cpumap_map_delete,
     .preprocess_associate_program_type = _test_sample_map_associate_program,
-    .postprocess_map_find_element = _test_sample_hash_map_find_entry,
-    .preprocess_map_update_element = _test_sample_hash_map_update_entry,
-    .postprocess_map_delete_element = _test_sample_hash_map_delete_entry,
+    .postprocess_map_find_element = _test_cpumap_find_element,
+    .preprocess_map_update_element = _test_cpumap_update_element,
+    .postprocess_map_delete_element = _test_cpumap_postprocess_delete_element,
     .preprocess_map_mutation_v2 = _test_cpumap_preprocess_mutation_v2,
     .postprocess_map_mutation_complete_v2 = _test_cpumap_postprocess_mutation_complete_v2,
     .preprocess_map_activate = _test_cpumap_preprocess_map_activate,
@@ -308,11 +360,102 @@ static ebpf_map_provider_data_t _test_cpumap_provider_data = {
     &_test_cpumap_hash_map_provider_properties,
     (ebpf_base_map_provider_dispatch_table_t*)&_test_cpumap_hash_map_dispatch_table_v2};
 
+// Malformed-provider defects used by the CPUMAP provider-requirement negative tests (design section 17.2). Each
+// defect makes the otherwise well-formed version 2 CPUMAP provider violate exactly one locked requirement.
+typedef enum _test_cpumap_provider_defect
+{
+    TEST_CPUMAP_DEFECT_NONE = 0,
+    TEST_CPUMAP_DEFECT_UPDATES_ORIGINAL_FALSE,     ///< updates_original_value == FALSE (item 9).
+    TEST_CPUMAP_DEFECT_V1_TABLE,                   ///< Publish a version 1 dispatch table (item 4).
+    TEST_CPUMAP_DEFECT_MISSING_ACTIVATE,           ///< NULL activate/deactivate pair (item 4).
+    TEST_CPUMAP_DEFECT_MISSING_MUTATION,           ///< NULL mutation gate/completion pair (item 4).
+    TEST_CPUMAP_DEFECT_MISSING_REJECTABLE_DELETE,  ///< NULL rejectable delete-v2 (item 4/8).
+    TEST_CPUMAP_DEFECT_MISSING_POSTPROCESS_DELETE, ///< NULL non-rejectable post-delete (item 8).
+    TEST_CPUMAP_DEFECT_DEPRECATED_PREDELETE_SET,   ///< Deprecated pre-delete slot non-NULL (item 8).
+} test_cpumap_provider_defect_t;
+
+// Restore the shared CPUMAP provider data/dispatch table/properties to the well-formed, design-compliant baseline so a
+// prior malformed-provider negative test can never leak a defect into a later test regardless of ordering.
+static void
+_reset_test_cpumap_provider_to_well_formed()
+{
+    ebpf_base_map_provider_dispatch_table_v2_t* t = &_test_cpumap_hash_map_dispatch_table_v2;
+    t->header.version = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_VERSION_2;
+    t->header.size = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_SIZE;
+    t->header.total_size = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_TOTAL_SIZE;
+    t->preprocess_map_create = _test_cpumap_map_create;
+    t->postprocess_map_delete = _test_cpumap_map_delete;
+    t->preprocess_associate_program_type = _test_sample_map_associate_program;
+    t->postprocess_map_find_element = _test_cpumap_find_element;
+    t->preprocess_map_update_element = _test_cpumap_update_element;
+#pragma warning(push)
+#pragma warning(disable : 4996)
+    t->preprocess_map_delete_element = nullptr;
+#pragma warning(pop)
+    t->postprocess_map_delete_element = _test_cpumap_postprocess_delete_element;
+    t->preprocess_map_mutation_v2 = _test_cpumap_preprocess_mutation_v2;
+    t->postprocess_map_mutation_complete_v2 = _test_cpumap_postprocess_mutation_complete_v2;
+    t->preprocess_map_activate = _test_cpumap_preprocess_map_activate;
+    t->postprocess_map_deactivate = _test_cpumap_postprocess_map_deactivate;
+    t->preprocess_map_delete_element_v2 = _test_cpumap_preprocess_map_delete_element_v2;
+
+    _test_cpumap_hash_map_provider_properties.updates_original_value = true;
+
+    _test_cpumap_provider_data.base_provider_table = (ebpf_base_map_provider_dispatch_table_t*)t;
+}
+
+// Apply a single malformed-provider defect on top of the well-formed baseline.
+static void
+_apply_test_cpumap_provider_defect(test_cpumap_provider_defect_t defect)
+{
+    ebpf_base_map_provider_dispatch_table_v2_t* t = &_test_cpumap_hash_map_dispatch_table_v2;
+    switch (defect) {
+    case TEST_CPUMAP_DEFECT_NONE:
+        break;
+    case TEST_CPUMAP_DEFECT_UPDATES_ORIGINAL_FALSE:
+        _test_cpumap_hash_map_provider_properties.updates_original_value = false;
+        break;
+    case TEST_CPUMAP_DEFECT_V1_TABLE:
+        // Advertise a version 1 header so the runtime never sees a version 2 table for CPUMAP.
+        t->header.version = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_CURRENT_VERSION;
+        t->header.size = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_CURRENT_VERSION_SIZE;
+        t->header.total_size = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_CURRENT_VERSION_TOTAL_SIZE;
+        break;
+    case TEST_CPUMAP_DEFECT_MISSING_ACTIVATE:
+        t->preprocess_map_activate = nullptr;
+        t->postprocess_map_deactivate = nullptr;
+        break;
+    case TEST_CPUMAP_DEFECT_MISSING_MUTATION:
+        t->preprocess_map_mutation_v2 = nullptr;
+        t->postprocess_map_mutation_complete_v2 = nullptr;
+        break;
+    case TEST_CPUMAP_DEFECT_MISSING_REJECTABLE_DELETE:
+        t->preprocess_map_delete_element_v2 = nullptr;
+        break;
+    case TEST_CPUMAP_DEFECT_MISSING_POSTPROCESS_DELETE:
+        t->postprocess_map_delete_element = nullptr;
+        break;
+    case TEST_CPUMAP_DEFECT_DEPRECATED_PREDELETE_SET:
+#pragma warning(push)
+#pragma warning(disable : 4996)
+        t->preprocess_map_delete_element = _test_sample_hash_map_preprocess_delete_entry;
+#pragma warning(pop)
+        break;
+    }
+}
+
 typedef class _test_sample_map_provider
 {
     // Map provider implementation
   public:
-    ~_test_sample_map_provider()
+    ~_test_sample_map_provider() { deregister(); }
+
+    // Explicitly deregister the NMR provider. Idempotent and safe to call from any thread. Blocks until deregistration
+    // completes: NMR calls the map client's ClientDetachProvider synchronously, which for a CPUMAP waits on the map's
+    // provider rundown reference. So while an activation token is held, this call is blocked strictly before the
+    // provider observes its client-detach notification.
+    void
+    deregister()
     {
         if (_map_provider_handle != INVALID_HANDLE_VALUE) {
             NTSTATUS status = NmrDeregisterProvider(_map_provider_handle);
@@ -327,7 +470,12 @@ typedef class _test_sample_map_provider
     }
 
     ebpf_result_t
-    initialize(uint32_t map_type, bool object_map, bool register_crud_apis = true, bool use_postprocess_delete = true)
+    initialize(
+        uint32_t map_type,
+        bool object_map,
+        bool register_crud_apis = true,
+        bool use_postprocess_delete = true,
+        test_cpumap_provider_defect_t cpumap_defect = TEST_CPUMAP_DEFECT_NONE)
     {
         _object_map = object_map;
 
@@ -335,7 +483,11 @@ typedef class _test_sample_map_provider
         if (map_type == BPF_MAP_TYPE_CPUMAP) {
             UNREFERENCED_PARAMETER(register_crud_apis);
             UNREFERENCED_PARAMETER(use_postprocess_delete);
-            _test_cpumap_provider_data.base_properties->updates_original_value = object_map ? true : false;
+            // Start from the design-compliant baseline (updates_original_value == TRUE, full version 2 table) so a
+            // prior malformed-provider test cannot leak state, then apply any requested defect. The object_map flag is
+            // intentionally ignored for CPUMAP: item 9 mandates updates_original_value == TRUE.
+            _reset_test_cpumap_provider_to_well_formed();
+            _apply_test_cpumap_provider_defect(cpumap_defect);
             _map_provider_characteristics.ProviderRegistrationInstance.NpiSpecificCharacteristics =
                 &_test_cpumap_provider_data;
             NTSTATUS cpumap_status = NmrRegisterProvider(&_map_provider_characteristics, this, &_map_provider_handle);
@@ -846,6 +998,118 @@ _test_cpumap_preprocess_map_delete_element_v2(
         return EBPF_ACCESS_DENIED;
     }
     return EBPF_SUCCESS;
+}
+
+//
+// Dedicated CPUMAP base-CRUD callback bodies: plain value passthrough with updates_original_value == TRUE. These make
+// the CPUMAP mock design-compliant (item 9) without object-reference value semantics.
+//
+static ebpf_result_t
+_test_cpumap_map_create(
+    _In_ void* binding_context,
+    uint32_t map_type,
+    uint32_t key_size,
+    uint32_t value_size,
+    uint32_t max_entries,
+    _Out_ uint32_t* actual_value_size,
+    _Outptr_ void** map_context)
+{
+    UNREFERENCED_PARAMETER(map_type);
+    if (key_size == 0 || value_size == 0 || max_entries == 0) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+    test_sample_map_provider_t* provider = (test_sample_map_provider_t*)binding_context;
+
+    // Plain storage: the stored buffer is exactly the caller's value size.
+    *actual_value_size = value_size;
+
+    test_sample_hash_map_context_t* context = reinterpret_cast<test_sample_hash_map_context_t*>(
+        ebpf_allocate_with_tag(sizeof(test_sample_hash_map_context_t), EBPF_POOL_TAG_DEFAULT));
+    if (context == NULL) {
+        return EBPF_NO_MEMORY;
+    }
+    context->map_provider = provider;
+    *map_context = (void*)context;
+    return EBPF_SUCCESS;
+}
+
+static void
+_test_cpumap_map_delete(_In_ void* binding_context, _In_ _Post_invalid_ void* map_context)
+{
+    UNREFERENCED_PARAMETER(binding_context);
+    test_sample_hash_map_context_t* context = (test_sample_hash_map_context_t*)map_context;
+    if (context != NULL) {
+        ebpf_free(context);
+    }
+}
+
+static ebpf_result_t
+_test_cpumap_find_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(binding_context);
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    // Plain passthrough: copy the stored value into the caller's output buffer.
+    if (out_value != NULL && out_value_size > 0 && in_value != NULL) {
+        memcpy(out_value, in_value, (std::min)(out_value_size, in_value_size));
+    }
+    return EBPF_SUCCESS;
+}
+
+static ebpf_result_t
+_test_cpumap_update_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(binding_context);
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    // Plain passthrough: store the caller's value verbatim.
+    if (out_value != NULL && out_value_size > 0 && in_value != NULL) {
+        memcpy(out_value, in_value, (std::min)(out_value_size, in_value_size));
+    }
+    return EBPF_SUCCESS;
+}
+
+static void
+_test_cpumap_postprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags)
+{
+    // Non-rejectable post-removal cleanup. Plain-value CPUMAP mock keeps no per-element provider state, so this is a
+    // no-op beyond satisfying the required non-rejectable post-delete contract.
+    UNREFERENCED_PARAMETER(binding_context);
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(value_size);
+    UNREFERENCED_PARAMETER(value);
+    UNREFERENCED_PARAMETER(flags);
 }
 
 // XDP program information.

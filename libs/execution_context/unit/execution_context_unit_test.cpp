@@ -36,6 +36,11 @@ extern "C"
     bool
     ebpf_program_is_valid_general_helper_provider_data(
         _In_ PNPI_MODULEID npi_module_id, _In_opt_ const ebpf_program_data_t* program_data);
+
+    // Test-only whitebox observability seam defined in ebpf_maps.c. Reports whether a custom-map provider rundown has
+    // entered the run-down (waiting) state. Used to build a deterministic teardown barrier in the CPUMAP rundown test.
+    bool
+    ebpf_map_provider_rundown_is_active(_In_ const ebpf_map_provider_reference_t* map_reference);
 }
 
 struct scoped_cpu_affinity
@@ -3072,39 +3077,60 @@ TEST_CASE("cpumap_rundown_token_held", "[cpumap]")
     ebpf_provider_rundown_token_t* token = nullptr;
     REQUIRE(ebpf_map_invoke_provider_activate(&reference, &context, &activation_context, &token) == EBPF_SUCCESS);
     REQUIRE(token != nullptr);
+    // The activation token has just acquired the provider rundown reference, so the rundown is not yet running down.
+    REQUIRE(ebpf_map_provider_rundown_is_active(&reference) == false);
 
-    // Drop the helper object reference; only the local map_ptr keeps the object alive now.
-    ebpf_map_release_provider_reference(&reference);
-
-    // Release the final object reference and kick the epoch so the deferred map free runs. Object teardown is
-    // epoch-deferred and the actual free executes on a background epoch worker: ebpf_custom_map_delete releases the
-    // create-time rundown reference and then blocks in ExWaitForRundownProtectionRelease until the *activation* rundown
-    // reference held by the token is released. Only after that wait completes does the map deregister its NMR client,
-    // which invokes the provider's detach callback. So the detach callback is the observable proof that teardown is
-    // gated on the token's rundown reference (design 17.1 gap 9).
-    std::thread teardown_kicker([&cpumap]() {
-        cpumap.reset();
-        ebpf_epoch_synchronize();
+    // Drive a REAL provider deregistration on a worker thread. NMR invokes the map client's ClientDetachProvider
+    // synchronously inside NmrDeregisterProvider, and for a CPUMAP that handler blocks in
+    // ExWaitForRundownProtectionRelease on the very provider rundown reference the activation token holds. So the
+    // deregistration cannot complete, and the provider can never observe its client-detach notification, until the
+    // token releases that reference. The map object reference (reference) and the map_ptr are both retained here, so
+    // the map (and its provider map context) stays alive across deactivation -- this is the use-after-free the prior
+    // version of this test masked by releasing the map reference too early.
+    std::atomic<bool> deregister_returned{false};
+    std::thread deregister_thread([&cpumap_provider, &deregister_returned]() {
+        cpumap_provider.deregister();
+        deregister_returned.store(true, std::memory_order_release);
     });
 
-    // While the token is held, teardown is blocked in the rundown wait, strictly before NMR client deregister, so the
-    // provider can never observe a detach. This holds regardless of scheduling: the worker cannot pass the wait until
-    // the token is released below.
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // Deterministic barrier (no fixed sleep): spin until the rundown reference transitions to the run-down state,
+    // which happens the instant the deregister thread enters ExWaitForRundownProtectionRelease. This is a positive,
+    // edge-triggered observation of the rundown mechanism rather than a guess that "enough time has passed". A
+    // generous deadline converts a genuine regression (deregistration NOT gated on the token) into a fast failure
+    // instead of a hang.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!ebpf_map_provider_rundown_is_active(&reference)) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+    }
+
+    // The deregister thread is now provably parked in the rundown wait, strictly before NMR delivers the provider's
+    // client-detach notification. Because the token still holds the rundown reference, nothing can have progressed
+    // past the wait: deregistration has not returned and the provider has observed neither detach nor deactivate.
+    REQUIRE(deregister_returned.load(std::memory_order_acquire) == false);
     REQUIRE(cpumap_provider.client_detach_count() == 0);
     REQUIRE(cpumap_provider.deactivate_count() == 0);
 
-    // Deactivation releases the token's rundown reference, unblocking the pending teardown.
+    // Consume the token. This releases the rundown reference, which is the ONLY thing that can unblock the pending
+    // deregistration. The provider map context is still valid because the map reference was retained.
     ebpf_map_invoke_provider_deactivate(&reference, activation_context, token);
     REQUIRE(cpumap_provider.deactivate_count() == 1);
     REQUIRE(cpumap_provider.activation_context_roundtrip_ok());
 
-    teardown_kicker.join();
+    // Drop the retained references BEFORE joining. The rundown proof above is already complete: the map stayed alive
+    // across the entire activate -> blocked-deregister -> deactivate sequence, which is what makes the use-after-free
+    // observable rather than masked. Releasing here is required for progress, not convenience: NMR's provider
+    // deregistration completes in nmr_t::remove(), which waits (in an untimed loop) until the provider has no
+    // remaining bindings, and this map's client binding is only torn down when the map itself is freed. Joining while
+    // still holding the map would therefore deadlock -- the deregister thread would wait forever for a binding that
+    // only the main thread can release, while the main thread waits in join().
+    ebpf_map_release_provider_reference(&reference);
+    cpumap.reset();
 
-    // Now that the rundown reference is released, teardown must run to completion and detach the provider's client.
-    for (int i = 0; i < 500 && cpumap_provider.client_detach_count() == 0; i++) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    // Deterministic completion barrier: the join returns only once the (now unblocked) deregistration has run to
+    // completion. No polling sleep -- the thread signals real completion.
+    deregister_thread.join();
+    REQUIRE(deregister_returned.load(std::memory_order_acquire) == true);
     REQUIRE(cpumap_provider.client_detach_count() == 1);
 }
 
