@@ -4475,6 +4475,18 @@ static ebpf_map_type_t _supported_base_map_types[] = {BPF_MAP_TYPE_HASH};
     ((dispatch)->postprocess_map_delete_element != NULL || (dispatch)->preprocess_map_delete_element != NULL)
 
 /**
+ * @brief Helper to check if the provider registered the preferred non-rejectable post-delete callback.
+ *
+ * The documented contract for postprocess_map_delete_element is that it runs AFTER the entry has been removed from the
+ * base map and AFTER the per-bucket lock has been released (see ebpf_extension.h). Providers that register it are
+ * therefore routed through the hash table's post-removal FREE notification, and map cleanup notifies them after the
+ * element has been removed and the map lock dropped. Providers that only register the deprecated rejectable
+ * preprocess_map_delete_element keep their historical pre-removal behavior, because rejecting a delete is only
+ * possible before it happens.
+ */
+#define HAS_POST_DELETE_ELEMENT_CALLBACK(dispatch) ((dispatch)->postprocess_map_delete_element != NULL)
+
+/**
  * @brief Invoke the provider's delete element callback (either preprocess or postprocess).
  * Exactly one of the two should be non-NULL (validated at map creation time).
  *
@@ -4523,6 +4535,16 @@ typedef struct _ebpf_custom_map
     size_t actual_value_size;
     uint32_t provider_flags;
     EX_RUNDOWN_REF provider_rundown_reference; // Synchronization for provider access.
+
+    // Snapshot buffers used exclusively by the post-removal map-cleanup path. They are provisioned during map creation
+    // - and map creation fails if they cannot be allocated - so that cleanup is allocation-free. Cleanup removes each
+    // element from the base map with the hash-table free notification suppressed and notifies the provider afterwards,
+    // outside the map lock. If that snapshot had to be allocated during teardown, an allocation failure would delete
+    // the element without ever delivering postprocess_map_delete_element, silently leaking the provider's per-entry
+    // state exactly when it hurts most: low-memory teardown. Both pointers are NULL for providers that do not register
+    // postprocess_map_delete_element; those keep their notify-before-removal cleanup and never read these buffers.
+    uint8_t* cleanup_key_snapshot;
+    uint8_t* cleanup_value_snapshot;
 } ebpf_custom_map_t;
 
 static ebpf_map_client_data_t _ebpf_custom_map_client_data = {
@@ -4575,6 +4597,10 @@ _ebpf_custom_map_delete(_In_ _Post_ptr_invalid_ ebpf_custom_map_t* map)
 
     ebpf_lock_destroy(&map->lock);
     ebpf_free_cache_aligned(map->provider_dispatch);
+    // Unconditional and NULL-safe: this is the single teardown path for a custom map (both the map-creation failure
+    // path and ebpf_custom_map_delete funnel here), so each provisioned snapshot buffer is freed exactly once.
+    ebpf_free(map->cleanup_key_snapshot);
+    ebpf_free(map->cleanup_value_snapshot);
     ebpf_free(map->core_map.name.value);
     ebpf_free_cache_aligned(map);
 }
@@ -4613,6 +4639,57 @@ _clean_up_custom_hash_map(_Inout_ ebpf_custom_map_t* map)
 {
 
     ebpf_core_map_t* core_map = &map->core_map;
+
+    if (HAS_POST_DELETE_ELEMENT_CALLBACK(map->provider_dispatch)) {
+        // Post-removal contract: the provider's post-delete callback must run AFTER the element has left the base map
+        // and OUTSIDE the map lock, so a provider can acquire its own locks during cleanup without risking a
+        // lock-order inversion. Snapshot each element, remove it under the lock (the hash table's own free
+        // notification is suppressed by passing a NULL operation context), then notify the provider once the lock is
+        // dropped.
+        //
+        // This loop is deliberately allocation-free. The snapshot buffers were provisioned at map creation, which
+        // fails if they cannot be allocated, so there is no path in which an element is removed from the base map
+        // while its post-removal notification is skipped.
+        uint32_t key_size = core_map->ebpf_map_definition.key_size;
+        size_t value_size = map->actual_value_size;
+        uint8_t* key_copy = map->cleanup_key_snapshot;
+        uint8_t* value_copy = map->cleanup_value_snapshot;
+        ebpf_assert(key_copy != NULL && value_copy != NULL);
+        __analysis_assume(key_copy != NULL);
+        __analysis_assume(value_copy != NULL);
+
+        for (;;) {
+            ebpf_lock_state_t cleanup_lock_state = ebpf_lock_lock(&map->lock);
+            uint8_t* first_key = NULL;
+            uint8_t* value = NULL;
+            ebpf_result_t result = ebpf_hash_table_next_key_pointer_and_value(
+                (ebpf_hash_table_t*)core_map->data, NULL, &first_key, &value);
+            if (result != EBPF_SUCCESS) {
+                ebpf_lock_unlock(&map->lock, cleanup_lock_state);
+                break;
+            }
+            memcpy(key_copy, first_key, key_size);
+            memcpy(value_copy, value, value_size);
+            ebpf_assert_success(ebpf_hash_table_delete((ebpf_hash_table_t*)core_map->data, NULL, first_key));
+            ebpf_lock_unlock(&map->lock, cleanup_lock_state);
+
+            // Post-removal, outside the map lock. Reached for every removed element.
+            _invoke_delete_element_callback(
+                map->provider_dispatch,
+                map->provider_context,
+                core_map->custom_map_context,
+                key_size,
+                key_copy,
+                value_size,
+                value_copy,
+                EBPF_MAP_OPERATION_MAP_CLEANUP);
+        }
+        ebpf_assert(ebpf_hash_table_key_count((ebpf_hash_table_t*)core_map->data) == 0);
+        return;
+    }
+
+    // Deprecated pre-delete providers keep their historical behavior: notify under the lock, before removal, using the
+    // delete-previous-key iterator pattern so the notification still sees a valid value pointer.
     ebpf_lock_state_t lock_state = ebpf_lock_lock(&map->lock);
 
     uint8_t* previous_key = NULL;
@@ -4939,7 +5016,54 @@ ebpf_custom_map_create(
         }
     }
 
-    bool pre_free_notification_supported = custom_map->provider_dispatch->preprocess_map_update_element != NULL;
+    // Delete-notification delivery is selected by callback semantics, not by provider version.
+    //
+    // The hash table's PRE_FREE hook runs under the per-bucket lock and BEFORE the entry is removed, and its return
+    // value can abort the delete. That is required by the deprecated rejectable preprocess_map_delete_element, so
+    // providers that register only that callback keep using it (unchanged historical behavior).
+    //
+    // The preferred postprocess_map_delete_element is documented to run AFTER removal and AFTER the bucket lock is
+    // released, and it cannot reject. Routing it through PRE_FREE - which the runtime previously did for every
+    // provider that also supplied preprocess_map_update_element - violates that contract and forces the provider to do
+    // its cleanup under a base-map spin lock. Such providers therefore use the post-removal FREE notification.
+    bool pre_free_notification_supported = !HAS_POST_DELETE_ELEMENT_CALLBACK(custom_map->provider_dispatch) &&
+                                           custom_map->provider_dispatch->preprocess_map_update_element != NULL;
+
+    if (HAS_POST_DELETE_ELEMENT_CALLBACK(custom_map->provider_dispatch)) {
+        // Provision the cleanup snapshot buffers here so that map teardown is allocation-free. Map cleanup removes
+        // each element from the base map with the hash-table free notification suppressed and notifies the provider
+        // afterwards, outside the map lock. If that snapshot had to be allocated during teardown, an allocation
+        // failure would delete the element without ever delivering postprocess_map_delete_element, leaking the
+        // provider's per-entry state. Failing map creation instead keeps the post-removal notification unconditional
+        // for the map's whole lifetime.
+        //
+        // The predicate is evaluated from the dispatch table captured at attach, which is fixed for the map's
+        // lifetime, so it is identical here and in _clean_up_custom_hash_map.
+        if (map_definition->key_size == 0) {
+            // Cleanup must be able to snapshot the key of every element it removes.
+            EBPF_LOG_MESSAGE_UINT64(
+                EBPF_TRACELOG_LEVEL_ERROR,
+                EBPF_TRACELOG_KEYWORD_MAP,
+                "Custom map with a post-delete callback requires a non-zero key size",
+                custom_map->core_map.ebpf_map_definition.type);
+            result = EBPF_INVALID_ARGUMENT;
+            goto Done;
+        }
+
+        custom_map->cleanup_key_snapshot =
+            (uint8_t*)ebpf_allocate_with_tag(map_definition->key_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        custom_map->cleanup_value_snapshot =
+            (uint8_t*)ebpf_allocate_with_tag(actual_value_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        if (custom_map->cleanup_key_snapshot == NULL || custom_map->cleanup_value_snapshot == NULL) {
+            EBPF_LOG_MESSAGE_UINT64(
+                EBPF_TRACELOG_LEVEL_ERROR,
+                EBPF_TRACELOG_KEYWORD_MAP,
+                "Failed to allocate cleanup snapshot buffers for custom map type",
+                custom_map->core_map.ebpf_map_definition.type);
+            result = EBPF_NO_MEMORY;
+            goto Done;
+        }
+    }
 
     // Create hash map.
     result = _ebpf_custom_map_create_hash_map(
@@ -5104,7 +5228,7 @@ _ebpf_custom_map_client_attach_provider(
             "NmrClientAttachProvider failed for custom map",
             status);
 
-        ebpf_free((void*)custom_map->provider_dispatch);
+        ebpf_free_cache_aligned((void*)custom_map->provider_dispatch);
         custom_map->provider_dispatch = NULL;
         goto Done;
     } else {
@@ -5119,7 +5243,7 @@ Done:
         ebpf_lock_unlock(&custom_map->lock, state);
     }
 
-    ebpf_free(provider_dispatch_table);
+    ebpf_free_cache_aligned(provider_dispatch_table);
     return status;
 }
 
@@ -5346,5 +5470,51 @@ ebpf_custom_map_associate_program(_Inout_ ebpf_map_t* map, _In_ const struct _eb
         custom_map->provider_context, custom_map->core_map.custom_map_context, &program_type);
 
     return result;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_map_acquire_provider_reference(
+    _In_opt_ const void* map, ebpf_map_type_t expected_map_type, _Out_ ebpf_map_provider_reference_t* map_reference)
+{
+    if (map_reference == NULL) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+    memset(map_reference, 0, sizeof(*map_reference));
+
+    if (map == NULL) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+
+    ebpf_core_object_t* object = (ebpf_core_object_t*)map;
+    if (object->type != EBPF_OBJECT_MAP) {
+        return EBPF_INVALID_OBJECT;
+    }
+
+    ebpf_core_map_t* core_map = (ebpf_core_map_t*)map;
+    if (core_map->custom_map_context == NULL) {
+        // Not a custom map: built-in maps have no provider context to hand out.
+        return EBPF_INVALID_OBJECT;
+    }
+    if ((ebpf_map_type_t)core_map->ebpf_map_definition.type != expected_map_type) {
+        return EBPF_INVALID_OBJECT;
+    }
+
+    // Increment the existing (nonzero) object reference. The caller keeps the map alive for the duration of this call,
+    // so the object is guaranteed to still be referenced here.
+    EBPF_OBJECT_ACQUIRE_REFERENCE(&core_map->object);
+
+    map_reference->map_object = core_map;
+    map_reference->provider_map_context = core_map->custom_map_context;
+    map_reference->map_type = expected_map_type;
+    return EBPF_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL) void ebpf_map_release_provider_reference(
+    _In_ const ebpf_map_provider_reference_t* map_reference)
+{
+    if (map_reference == NULL || map_reference->map_object == NULL) {
+        return;
+    }
+    ebpf_core_map_t* core_map = (ebpf_core_map_t*)map_reference->map_object;
+    EBPF_OBJECT_RELEASE_REFERENCE(&core_map->object);
 }
 #pragma endregion

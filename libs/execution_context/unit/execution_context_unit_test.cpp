@@ -6,17 +6,24 @@
 #include "catch_wrapper.hpp"
 #include "ebpf_async.h"
 #include "ebpf_core.h"
+#include "ebpf_epoch.h"
 #include "ebpf_maps.h"
 #include "ebpf_object.h"
 #include "ebpf_program.h"
 #include "ebpf_ring_buffer.h"
 #include "execution_context_unit_test_jit.h"
 #include "helpers.h"
+#include "hook_helper.h"
 #include "test_helper.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <optional>
 #include <set>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 extern "C"
 {
@@ -2810,3 +2817,1048 @@ TEST_CASE("INVALID_GENERAL_HELPER_PROGRAM_DATA", "[execution_context][negative]"
 // https://github.com/microsoft/ebpf-for-windows/issues/1139
 // EBPF_OPERATION_LOAD_NATIVE_MODULE
 // EBPF_OPERATION_LOAD_NATIVE_PROGRAMS
+
+//
+// Increment 1 tests: BPF_MAP_TYPE_CPUMAP, the generic post-delete ordering correction, and the attach-time map
+// enumeration/reference APIs.
+//
+// These use a self-contained custom-map provider so the shape of the provider dispatch table (which delete callback
+// it registers, and whether it registers preprocess_map_update_element) can be varied per test without perturbing the
+// shared sample-map provider in helpers.h.
+//
+
+typedef enum _custom_map_test_shape
+{
+    // Preferred non-rejectable post-delete plus an update callback. This is the XSKMAP / CPUMAP shape, and the shape
+    // whose delete notification the runtime previously mis-delivered through the pre-removal PRE_FREE hook.
+    CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE = 0,
+    // Preferred non-rejectable post-delete with no update callback. This shape already used the post-removal FREE
+    // notification, so it is the control that proves the fix did not change correct behavior.
+    CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITHOUT_UPDATE,
+    // Deprecated rejectable pre-delete plus an update callback. Must keep its pre-removal, rejectable behavior.
+    CUSTOM_MAP_TEST_SHAPE_DEPRECATED_PRE_DELETE,
+} custom_map_test_shape_t;
+
+class custom_map_test_provider_t;
+
+typedef struct _custom_map_test_map_context
+{
+    custom_map_test_provider_t* provider;
+} custom_map_test_map_context_t;
+
+// Observation of one delete-element callback: key, provider-stored value, and operation flags.
+typedef std::tuple<uint32_t, uint32_t, uint32_t> custom_map_test_delete_observation_t;
+
+static ebpf_result_t
+_custom_map_test_create(
+    _In_ void* binding_context,
+    uint32_t map_type,
+    uint32_t key_size,
+    uint32_t value_size,
+    uint32_t max_entries,
+    _Out_ uint32_t* actual_value_size,
+    _Outptr_ void** map_context);
+
+static void
+_custom_map_test_delete(_In_ void* binding_context, _In_ _Post_invalid_ void* map_context);
+
+static ebpf_result_t
+_custom_map_test_associate_program(
+    _In_ void* binding_context, _In_ void* map_context, _In_ const ebpf_program_type_t* program_type);
+
+_Success_(return == EBPF_SUCCESS) static ebpf_result_t _custom_map_test_find_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags);
+
+_Success_(return == EBPF_SUCCESS) static ebpf_result_t _custom_map_test_update_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags);
+
+static void
+_custom_map_test_postprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags);
+
+#pragma warning(push)
+#pragma warning(disable : 4996) // Suppress deprecation warning for the deprecated pre-delete typedef.
+static ebpf_result_t
+_custom_map_test_preprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags);
+#pragma warning(pop)
+
+class custom_map_test_provider_t
+{
+  public:
+    custom_map_test_provider_t() = default;
+    custom_map_test_provider_t(const custom_map_test_provider_t&) = delete;
+    void
+    operator=(const custom_map_test_provider_t&) = delete;
+
+    ~custom_map_test_provider_t() { deregister(); }
+
+    ebpf_result_t
+    initialize(ebpf_map_type_t map_type, custom_map_test_shape_t shape, bool updates_original_value)
+    {
+        _shape = shape;
+
+        ebpf_base_map_provider_dispatch_table_t dispatch_table = {
+            .header = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_HEADER,
+            .preprocess_map_create = _custom_map_test_create,
+            .postprocess_map_delete = _custom_map_test_delete,
+            .preprocess_associate_program_type = _custom_map_test_associate_program,
+            .postprocess_map_find_element = _custom_map_test_find_element,
+            .preprocess_map_update_element = _custom_map_test_update_element,
+            .postprocess_map_delete_element = _custom_map_test_postprocess_delete_element};
+        _dispatch_table = dispatch_table;
+
+        switch (shape) {
+        case CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE:
+            break;
+        case CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITHOUT_UPDATE:
+            _dispatch_table.preprocess_map_update_element = nullptr;
+            break;
+        case CUSTOM_MAP_TEST_SHAPE_DEPRECATED_PRE_DELETE:
+            _dispatch_table.postprocess_map_delete_element = nullptr;
+#pragma warning(push)
+#pragma warning(disable : 4996)
+            _dispatch_table.preprocess_map_delete_element = _custom_map_test_preprocess_delete_element;
+#pragma warning(pop)
+            break;
+        }
+
+        ebpf_base_map_provider_properties_t properties = {
+            EBPF_BASE_MAP_PROVIDER_PROPERTIES_HEADER, updates_original_value};
+        _properties = properties;
+
+        ebpf_map_provider_data_t provider_data = {
+            EBPF_MAP_PROVIDER_DATA_HEADER, (uint32_t)map_type, BPF_MAP_TYPE_HASH, &_properties, &_dispatch_table};
+        _provider_data = provider_data;
+
+        // Give every provider instance a distinct module id so concurrently registered providers never collide.
+        if (ebpf_guid_create(&_module_id.Guid) != EBPF_SUCCESS) {
+            return EBPF_NO_MEMORY;
+        }
+        _module_id.Length = sizeof(NPI_MODULEID);
+        _module_id.Type = MIT_GUID;
+
+        _provider_characteristics.Length = sizeof(NPI_PROVIDER_CHARACTERISTICS);
+        _provider_characteristics.ProviderAttachClient = (NPI_PROVIDER_ATTACH_CLIENT_FN*)_attach_client;
+        _provider_characteristics.ProviderDetachClient = (NPI_PROVIDER_DETACH_CLIENT_FN*)_detach_client;
+        _provider_characteristics.ProviderCleanupBindingContext = nullptr;
+        _provider_characteristics.ProviderRegistrationInstance.Size = sizeof(NPI_REGISTRATION_INSTANCE);
+        _provider_characteristics.ProviderRegistrationInstance.NpiId = &EBPF_MAP_INFO_EXTENSION_IID;
+        _provider_characteristics.ProviderRegistrationInstance.ModuleId = &_module_id;
+        _provider_characteristics.ProviderRegistrationInstance.NpiSpecificCharacteristics = &_provider_data;
+
+        NTSTATUS status = NmrRegisterProvider(&_provider_characteristics, this, &_provider_handle);
+        return NT_SUCCESS(status) ? EBPF_SUCCESS : EBPF_FAILED;
+    }
+
+    void
+    deregister()
+    {
+        if (_provider_handle != INVALID_HANDLE_VALUE) {
+            NTSTATUS status = NmrDeregisterProvider(_provider_handle);
+            if (status == STATUS_PENDING) {
+                NmrWaitForProviderDeregisterComplete(_provider_handle);
+            } else {
+                REQUIRE(NT_SUCCESS(status));
+            }
+            _provider_handle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    static NTSTATUS
+    _attach_client(
+        _In_ HANDLE nmr_binding_handle,
+        _Inout_ void* provider_context,
+        _In_ const NPI_REGISTRATION_INSTANCE* client_registration_instance,
+        _In_ const void* client_binding_context,
+        _In_ const void* client_dispatch,
+        _Outptr_ void** provider_binding_context,
+        _Outptr_result_maybenull_ const void** provider_dispatch)
+    {
+        UNREFERENCED_PARAMETER(nmr_binding_handle);
+        UNREFERENCED_PARAMETER(client_registration_instance);
+        UNREFERENCED_PARAMETER(client_binding_context);
+        UNREFERENCED_PARAMETER(client_dispatch);
+        *provider_binding_context = provider_context;
+        *provider_dispatch = nullptr;
+        return STATUS_SUCCESS;
+    }
+
+    static NTSTATUS
+    _detach_client(_In_ const void* provider_binding_context)
+    {
+        UNREFERENCED_PARAMETER(provider_binding_context);
+        return STATUS_SUCCESS;
+    }
+
+    custom_map_test_shape_t
+    shape() const
+    {
+        return _shape;
+    }
+
+    // The map used by the delete callbacks to probe whether the entry is still reachable in the base map at the
+    // instant the callback runs. This is the ordering observation: the documented contract for
+    // postprocess_map_delete_element is that the entry has already been removed.
+    void
+    set_probe_map(_In_opt_ ebpf_map_t* map)
+    {
+        _probe_map = map;
+    }
+
+    void
+    set_reject_delete(bool reject)
+    {
+        _reject_delete = reject;
+    }
+    bool
+    reject_delete() const
+    {
+        return _reject_delete;
+    }
+
+    void
+    note_map_created(_In_ void* map_context)
+    {
+        _create_count++;
+        _last_map_context = map_context;
+    }
+    void
+    note_map_deleted()
+    {
+        _delete_count++;
+    }
+    void
+    note_update()
+    {
+        _update_count++;
+    }
+    void
+    note_find()
+    {
+        _find_count++;
+    }
+
+    void
+    note_delete_element(
+        size_t key_size,
+        _In_reads_opt_(key_size) const uint8_t* key,
+        size_t value_size,
+        _In_reads_opt_(value_size) const uint8_t* value,
+        uint32_t flags)
+    {
+        uint32_t key_value = 0;
+        uint32_t stored_value = 0;
+        if (key != nullptr && key_size >= sizeof(key_value)) {
+            memcpy(&key_value, key, sizeof(key_value));
+        }
+        if (value != nullptr && value_size >= sizeof(stored_value)) {
+            memcpy(&stored_value, value, sizeof(stored_value));
+        }
+        _observed_deletes.push_back(custom_map_test_delete_observation_t(key_value, stored_value, flags));
+
+        if (_probe_map == nullptr || key == nullptr || key_size < sizeof(key_value)) {
+            return;
+        }
+
+        // Re-enter the map to observe whether the entry is still published. ebpf_hash_table_find is lock free, so
+        // this is safe even in the (incorrect) case where the notification is delivered under the bucket lock.
+        uint32_t probe_value = 0;
+        bool present =
+            ebpf_map_find_entry(_probe_map, sizeof(key_value), key, sizeof(probe_value), (uint8_t*)&probe_value, 0) ==
+            EBPF_SUCCESS;
+
+        if (flags & EBPF_MAP_OPERATION_MAP_CLEANUP) {
+            present ? _cleanup_probe_present++ : _cleanup_probe_absent++;
+        } else if (flags & EBPF_MAP_OPERATION_UPDATE) {
+            // Replacement: the new value is published by design, so presence here is expected and is not an
+            // ordering observation.
+            _replace_probe_count++;
+        } else {
+            present ? _delete_probe_present++ : _delete_probe_absent++;
+        }
+    }
+
+    uint32_t
+    create_count() const
+    {
+        return _create_count;
+    }
+    uint32_t
+    delete_count() const
+    {
+        return _delete_count;
+    }
+    uint32_t
+    update_count() const
+    {
+        return _update_count;
+    }
+    uint32_t
+    find_count() const
+    {
+        return _find_count;
+    }
+    uint32_t
+    delete_element_count() const
+    {
+        return (uint32_t)_observed_deletes.size();
+    }
+    uint32_t
+    delete_probe_present() const
+    {
+        return _delete_probe_present;
+    }
+    uint32_t
+    delete_probe_absent() const
+    {
+        return _delete_probe_absent;
+    }
+    uint32_t
+    cleanup_probe_present() const
+    {
+        return _cleanup_probe_present;
+    }
+    uint32_t
+    cleanup_probe_absent() const
+    {
+        return _cleanup_probe_absent;
+    }
+    uint32_t
+    replace_probe_count() const
+    {
+        return _replace_probe_count;
+    }
+    _Ret_maybenull_ void*
+    last_map_context() const
+    {
+        return _last_map_context;
+    }
+    const std::vector<custom_map_test_delete_observation_t>&
+    observed_deletes() const
+    {
+        return _observed_deletes;
+    }
+    void
+    reset_observations()
+    {
+        _observed_deletes.clear();
+        _delete_probe_present = 0;
+        _delete_probe_absent = 0;
+        _cleanup_probe_present = 0;
+        _cleanup_probe_absent = 0;
+        _replace_probe_count = 0;
+    }
+
+  private:
+    HANDLE _provider_handle = INVALID_HANDLE_VALUE;
+    NPI_MODULEID _module_id = {sizeof(NPI_MODULEID), MIT_GUID, {0}};
+    NPI_PROVIDER_CHARACTERISTICS _provider_characteristics = {};
+    ebpf_map_provider_data_t _provider_data = {};
+    ebpf_base_map_provider_properties_t _properties = {};
+    ebpf_base_map_provider_dispatch_table_t _dispatch_table = {};
+
+    custom_map_test_shape_t _shape = CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE;
+    ebpf_map_t* _probe_map = nullptr;
+    bool _reject_delete = false;
+    void* _last_map_context = nullptr;
+    uint32_t _create_count = 0;
+    uint32_t _delete_count = 0;
+    uint32_t _update_count = 0;
+    uint32_t _find_count = 0;
+    uint32_t _delete_probe_present = 0;
+    uint32_t _delete_probe_absent = 0;
+    uint32_t _cleanup_probe_present = 0;
+    uint32_t _cleanup_probe_absent = 0;
+    uint32_t _replace_probe_count = 0;
+    std::vector<custom_map_test_delete_observation_t> _observed_deletes;
+};
+
+static ebpf_result_t
+_custom_map_test_create(
+    _In_ void* binding_context,
+    uint32_t map_type,
+    uint32_t key_size,
+    uint32_t value_size,
+    uint32_t max_entries,
+    _Out_ uint32_t* actual_value_size,
+    _Outptr_ void** map_context)
+{
+    UNREFERENCED_PARAMETER(map_type);
+    if (key_size == 0 || value_size == 0 || max_entries == 0) {
+        return EBPF_INVALID_ARGUMENT;
+    }
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+
+    // Plain storage: the provider-stored buffer is exactly the caller's value size.
+    *actual_value_size = value_size;
+
+    custom_map_test_map_context_t* context = (custom_map_test_map_context_t*)ebpf_allocate_with_tag(
+        sizeof(custom_map_test_map_context_t), EBPF_POOL_TAG_DEFAULT);
+    if (context == nullptr) {
+        return EBPF_NO_MEMORY;
+    }
+    context->provider = provider;
+    *map_context = context;
+    provider->note_map_created(context);
+    return EBPF_SUCCESS;
+}
+
+static void
+_custom_map_test_delete(_In_ void* binding_context, _In_ _Post_invalid_ void* map_context)
+{
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+    provider->note_map_deleted();
+    ebpf_free(map_context);
+}
+
+static ebpf_result_t
+_custom_map_test_associate_program(
+    _In_ void* binding_context, _In_ void* map_context, _In_ const ebpf_program_type_t* program_type)
+{
+    UNREFERENCED_PARAMETER(binding_context);
+    UNREFERENCED_PARAMETER(map_context);
+    if (*program_type != EBPF_PROGRAM_TYPE_SAMPLE) {
+        return EBPF_OPERATION_NOT_SUPPORTED;
+    }
+    return EBPF_SUCCESS;
+}
+
+_Success_(return == EBPF_SUCCESS) static ebpf_result_t _custom_map_test_find_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+    provider->note_find();
+    if (out_value != nullptr && out_value_size > 0 && in_value != nullptr) {
+        memcpy(out_value, in_value, (std::min)(out_value_size, in_value_size));
+    }
+    return EBPF_SUCCESS;
+}
+
+_Success_(return == EBPF_SUCCESS) static ebpf_result_t _custom_map_test_update_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t in_value_size,
+    _In_reads_(in_value_size) const uint8_t* in_value,
+    size_t out_value_size,
+    _Out_writes_opt_(out_value_size) uint8_t* out_value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    UNREFERENCED_PARAMETER(key_size);
+    UNREFERENCED_PARAMETER(key);
+    UNREFERENCED_PARAMETER(flags);
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+    provider->note_update();
+    if (out_value != nullptr && out_value_size > 0 && in_value != nullptr) {
+        memcpy(out_value, in_value, (std::min)(out_value_size, in_value_size));
+    }
+    return EBPF_SUCCESS;
+}
+
+static void
+_custom_map_test_postprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+    provider->note_delete_element(key_size, key, value_size, value, flags);
+}
+
+#pragma warning(push)
+#pragma warning(disable : 4996)
+static ebpf_result_t
+_custom_map_test_preprocess_delete_element(
+    _In_ void* binding_context,
+    _In_ void* map_context,
+    size_t key_size,
+    _In_reads_opt_(key_size) const uint8_t* key,
+    size_t value_size,
+    _In_reads_(value_size) const uint8_t* value,
+    uint32_t flags)
+{
+    UNREFERENCED_PARAMETER(map_context);
+    custom_map_test_provider_t* provider = (custom_map_test_provider_t*)binding_context;
+    if (provider->reject_delete() && !(flags & (EBPF_MAP_OPERATION_UPDATE | EBPF_MAP_OPERATION_MAP_CLEANUP))) {
+        return EBPF_ACCESS_DENIED;
+    }
+    provider->note_delete_element(key_size, key, value_size, value, flags);
+    return EBPF_SUCCESS;
+}
+#pragma warning(pop)
+
+static ebpf_result_t
+_try_create_custom_test_map(
+    ebpf_map_type_t map_type,
+    _Outptr_result_maybenull_ ebpf_map_t** map,
+    uint32_t key_size = sizeof(uint32_t),
+    uint32_t value_size = sizeof(uint32_t),
+    uint32_t max_entries = 8)
+{
+    ebpf_map_definition_in_memory_t map_definition{map_type, key_size, value_size, max_entries};
+    cxplat_utf8_string_t map_name = {0};
+    *map = nullptr;
+    return ebpf_map_create(&map_name, &map_definition, (uintptr_t)ebpf_handle_invalid, map);
+}
+
+static void
+_create_custom_test_map(
+    ebpf_map_type_t map_type,
+    _Inout_ map_ptr& map,
+    uint32_t key_size = sizeof(uint32_t),
+    uint32_t value_size = sizeof(uint32_t),
+    uint32_t max_entries = 8)
+{
+    ebpf_map_t* local_map = nullptr;
+    REQUIRE(_try_create_custom_test_map(map_type, &local_map, key_size, value_size, max_entries) == EBPF_SUCCESS);
+    REQUIRE(local_map != nullptr);
+    map.reset(local_map);
+}
+
+static ebpf_result_t
+_update_uint32_entry(_Inout_ ebpf_map_t* map, uint32_t key, uint32_t value, int flags = 0)
+{
+    return ebpf_map_update_entry(
+        map, sizeof(key), (const uint8_t*)&key, sizeof(value), (const uint8_t*)&value, EBPF_ANY, flags);
+}
+
+static ebpf_result_t
+_find_uint32_entry(_Inout_ ebpf_map_t* map, uint32_t key, _Out_ uint32_t* value, int flags = 0)
+{
+    *value = 0;
+    return ebpf_map_find_entry(map, sizeof(key), (const uint8_t*)&key, sizeof(*value), (uint8_t*)value, flags);
+}
+
+// Final map cleanup runs when the last object reference goes away, and is deferred to an epoch work item that can be
+// processed on another CPU's free list. Wait, with a bounded deadline, for the provider to observe the map teardown
+// callback. A genuine regression (teardown never delivered) fails fast instead of hanging.
+static void
+_wait_for_map_teardown(const custom_map_test_provider_t& provider, uint32_t expected_map_delete_count)
+{
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (provider.delete_count() < expected_map_delete_count) {
+        ebpf_epoch_synchronize();
+        if (provider.delete_count() >= expected_map_delete_count) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // Exactly one assertion regardless of how many polling iterations were needed, so the suite's assertion count is
+    // deterministic.
+    REQUIRE(provider.delete_count() == expected_map_delete_count);
+}
+
+TEST_CASE("cpumap_map_type_and_v1_provider_crud", "[cpumap]")
+{
+    // The CPUMAP map type is a custom map type: it has no built-in metadata, so it is only usable when an extension
+    // registers a provider for it.
+    static_assert(BPF_MAP_TYPE_CPUMAP == 17, "BPF_MAP_TYPE_CPUMAP must be 17, immediately after BPF_MAP_TYPE_XSKMAP");
+    static_assert(BPF_MAP_TYPE_XSKMAP == 16, "BPF_MAP_TYPE_XSKMAP must remain 16");
+    static_assert(BPF_MAP_TYPE_CPUMAP < BPF_MAP_TYPE_MAX, "BPF_MAP_TYPE_MAX must account for BPF_MAP_TYPE_CPUMAP");
+
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    // With no CPUMAP provider registered, map creation must fail.
+    {
+        ebpf_map_t* local_map = nullptr;
+        REQUIRE(_try_create_custom_test_map(BPF_MAP_TYPE_CPUMAP, &local_map) == EBPF_EXTENSION_FAILED_TO_LOAD);
+        REQUIRE(local_map == nullptr);
+    }
+
+    // CPUMAP registers a version 1 dispatch table with exactly the callback set XSKMAP uses, and sets
+    // updates_original_value == TRUE.
+    custom_map_test_provider_t provider;
+    REQUIRE(
+        provider.initialize(BPF_MAP_TYPE_CPUMAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap);
+    REQUIRE(provider.create_count() == 1);
+    REQUIRE(provider.last_map_context() != nullptr);
+
+    REQUIRE(_update_uint32_entry(cpumap.get(), 1, 100) == EBPF_SUCCESS);
+    REQUIRE(provider.update_count() == 1);
+
+    uint32_t value = 0;
+    REQUIRE(_find_uint32_entry(cpumap.get(), 1, &value) == EBPF_SUCCESS);
+    REQUIRE(value == 100);
+
+    uint32_t next_key = 0;
+    REQUIRE(ebpf_map_next_key(cpumap.get(), 0, nullptr, (uint8_t*)&next_key) == EBPF_SUCCESS);
+    REQUIRE(next_key == 1);
+
+    // Replacement update: the old value is reported through the delete callback with EBPF_MAP_OPERATION_UPDATE.
+    REQUIRE(_update_uint32_entry(cpumap.get(), 1, 200) == EBPF_SUCCESS);
+    REQUIRE(provider.delete_element_count() == 1);
+    REQUIRE(std::get<2>(provider.observed_deletes()[0]) & EBPF_MAP_OPERATION_UPDATE);
+    REQUIRE(std::get<1>(provider.observed_deletes()[0]) == 100);
+
+    REQUIRE(_find_uint32_entry(cpumap.get(), 1, &value) == EBPF_SUCCESS);
+    REQUIRE(value == 200);
+
+    REQUIRE(ebpf_map_delete_entry(cpumap.get(), sizeof(uint32_t), (const uint8_t*)&next_key, 0) == EBPF_SUCCESS);
+    REQUIRE(provider.delete_element_count() == 2);
+    REQUIRE(_find_uint32_entry(cpumap.get(), 1, &value) != EBPF_SUCCESS);
+
+    cpumap.reset();
+    // Final map cleanup is driven by the last object reference going away and completes under epoch control, so wait
+    // for the deferred teardown before observing the provider's map-delete callback.
+    _wait_for_map_teardown(provider, 1);
+}
+
+TEST_CASE("cpumap_bpf_program_crud_rejected", "[cpumap][negative]")
+{
+    // Design section 17.2 item 7: the CPUMAP provider sets updates_original_value == TRUE, matching XSKMAP, so
+    // BPF-program (helper) lookup/update/delete are rejected by the runtime before any PASSIVE-only provider
+    // callback can be reached at DISPATCH_LEVEL.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    custom_map_test_provider_t provider;
+    REQUIRE(
+        provider.initialize(BPF_MAP_TYPE_CPUMAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) == EBPF_SUCCESS);
+
+    map_ptr cpumap;
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap);
+
+    uint32_t key = 5;
+    uint64_t helper_value = 0;
+
+    REQUIRE(_update_uint32_entry(cpumap.get(), key, 500, EBPF_MAP_FLAG_HELPER) == EBPF_OPERATION_NOT_SUPPORTED);
+    REQUIRE(
+        ebpf_map_find_entry(
+            cpumap.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(helper_value),
+            (uint8_t*)&helper_value,
+            EBPF_MAP_FLAG_HELPER) == EBPF_OPERATION_NOT_SUPPORTED);
+    REQUIRE(
+        ebpf_map_delete_entry(cpumap.get(), sizeof(key), (const uint8_t*)&key, EBPF_MAP_FLAG_HELPER) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+
+    // The rejection happens in the runtime, before any provider CRUD callback runs.
+    REQUIRE(provider.update_count() == 0);
+    REQUIRE(provider.find_count() == 0);
+    REQUIRE(provider.delete_element_count() == 0);
+
+    // The same operations from user mode are accepted, proving the rejection is specific to the helper path.
+    REQUIRE(_update_uint32_entry(cpumap.get(), key, 500) == EBPF_SUCCESS);
+    REQUIRE(provider.update_count() == 1);
+}
+
+TEST_CASE("custom_map_post_delete_element_runs_after_removal", "[execution_context][custom_map_provider]")
+{
+    // Generic correctness fix (design section 8.5): postprocess_map_delete_element is documented to run AFTER the
+    // entry has been removed from the base map and AFTER the per-bucket lock has been released. The runtime used to
+    // deliver it through the hash table's pre-removal PRE_FREE hook whenever the provider also supplied
+    // preprocess_map_update_element, which is exactly the XSKMAP / CPUMAP shape.
+    //
+    // Both post-delete shapes are covered: with and without preprocess_map_update_element. The probe inside the
+    // callback re-reads the map, so "absent" proves the removal happened first.
+    struct shape_case
+    {
+        custom_map_test_shape_t shape;
+        const char* description;
+    };
+    static const shape_case shape_cases[] = {
+        {CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE,
+         "postprocess_map_delete_element + preprocess_map_update_element (XSKMAP/CPUMAP shape)"},
+        {CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITHOUT_UPDATE, "postprocess_map_delete_element only"},
+    };
+
+    for (const shape_case& test_case : shape_cases) {
+        CAPTURE(test_case.description);
+
+        _ebpf_core_initializer core;
+        core.initialize();
+
+        // updates_original_value requires find, update and delete callbacks, so the shape without an update callback
+        // must report FALSE. The value semantics are plain passthrough either way.
+        bool updates_original_value = (test_case.shape == CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE);
+
+        custom_map_test_provider_t provider;
+        REQUIRE(
+            provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, test_case.shape, updates_original_value) == EBPF_SUCCESS);
+
+        map_ptr map;
+        _create_custom_test_map(BPF_MAP_TYPE_SAMPLE_HASH_MAP, map);
+        provider.set_probe_map(map.get());
+
+        REQUIRE(_update_uint32_entry(map.get(), 11, 1100) == EBPF_SUCCESS);
+        REQUIRE(_update_uint32_entry(map.get(), 12, 1200) == EBPF_SUCCESS);
+
+        uint32_t key = 11;
+        REQUIRE(ebpf_map_delete_entry(map.get(), sizeof(key), (const uint8_t*)&key, 0) == EBPF_SUCCESS);
+
+        // Exactly one delete notification, delivered after removal.
+        CHECK(provider.delete_element_count() == 1);
+        CHECK(provider.delete_probe_absent() == 1);
+        CHECK(provider.delete_probe_present() == 0);
+
+        // The notification carried the key and the provider-stored value of the removed entry.
+        CHECK(std::get<0>(provider.observed_deletes()[0]) == 11);
+        CHECK(std::get<1>(provider.observed_deletes()[0]) == 1100);
+        CHECK(
+            (std::get<2>(provider.observed_deletes()[0]) &
+             (EBPF_MAP_OPERATION_UPDATE | EBPF_MAP_OPERATION_MAP_CLEANUP)) == 0);
+
+        // The surviving entry is untouched.
+        uint32_t value = 0;
+        CHECK(_find_uint32_entry(map.get(), 12, &value) == EBPF_SUCCESS);
+        CHECK(value == 1200);
+
+        provider.set_probe_map(nullptr);
+    }
+}
+
+TEST_CASE("custom_map_deprecated_pre_delete_is_unchanged", "[execution_context][custom_map_provider]")
+{
+    // Providers that register only the deprecated rejectable preprocess_map_delete_element must keep their existing
+    // pre-removal behavior: the callback runs before the entry leaves the base map and can still veto the delete.
+    // That behavior is only expressible through the PRE_FREE hook, so the ordering fix must not touch it.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    custom_map_test_provider_t provider;
+    REQUIRE(
+        provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, CUSTOM_MAP_TEST_SHAPE_DEPRECATED_PRE_DELETE, false) ==
+        EBPF_SUCCESS);
+
+    map_ptr map;
+    _create_custom_test_map(BPF_MAP_TYPE_SAMPLE_HASH_MAP, map);
+    provider.set_probe_map(map.get());
+
+    REQUIRE(_update_uint32_entry(map.get(), 21, 2100) == EBPF_SUCCESS);
+
+    // Rejection still works and leaves the entry in place.
+    provider.set_reject_delete(true);
+    uint32_t key = 21;
+    REQUIRE(ebpf_map_delete_entry(map.get(), sizeof(key), (const uint8_t*)&key, 0) != EBPF_SUCCESS);
+    uint32_t value = 0;
+    REQUIRE(_find_uint32_entry(map.get(), 21, &value) == EBPF_SUCCESS);
+    REQUIRE(value == 2100);
+    REQUIRE(provider.delete_element_count() == 0);
+
+    // Accepted delete: the callback observes the entry still published (pre-removal), which is the deprecated
+    // contract.
+    provider.set_reject_delete(false);
+    REQUIRE(ebpf_map_delete_entry(map.get(), sizeof(key), (const uint8_t*)&key, 0) == EBPF_SUCCESS);
+    REQUIRE(provider.delete_element_count() == 1);
+    REQUIRE(provider.delete_probe_present() == 1);
+    REQUIRE(provider.delete_probe_absent() == 0);
+    REQUIRE(_find_uint32_entry(map.get(), 21, &value) != EBPF_SUCCESS);
+
+    provider.set_probe_map(nullptr);
+}
+
+TEST_CASE("custom_map_cleanup_post_delete_after_removal", "[execution_context][custom_map_provider]")
+{
+    // Final map cleanup must also honor the post-removal contract, and must be allocation free: the snapshot buffers
+    // it uses are provisioned at map creation, so a low-memory teardown can never remove an entry without delivering
+    // its notification.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    custom_map_test_provider_t provider;
+    REQUIRE(
+        provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) ==
+        EBPF_SUCCESS);
+
+    map_ptr map;
+    _create_custom_test_map(BPF_MAP_TYPE_SAMPLE_HASH_MAP, map);
+    provider.set_probe_map(map.get());
+
+    const uint32_t entry_count = 5;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        REQUIRE(_update_uint32_entry(map.get(), i + 1, (i + 1) * 10) == EBPF_SUCCESS);
+    }
+    provider.reset_observations();
+
+    // Destroy the map. Every entry must be reported exactly once, with the cleanup flag, after removal.
+    map.reset();
+    _wait_for_map_teardown(provider, 1);
+
+    REQUIRE(provider.delete_element_count() == entry_count);
+    REQUIRE(provider.cleanup_probe_absent() == entry_count);
+    REQUIRE(provider.cleanup_probe_present() == 0);
+
+    // The snapshot handed to the provider must carry the real key and value of each removed entry, and every entry
+    // must be reported exactly once.
+    std::set<uint32_t> reported_keys;
+    for (const custom_map_test_delete_observation_t& observation : provider.observed_deletes()) {
+        uint32_t key = std::get<0>(observation);
+        uint32_t value = std::get<1>(observation);
+        uint32_t flags = std::get<2>(observation);
+        CHECK((flags & EBPF_MAP_OPERATION_MAP_CLEANUP) == EBPF_MAP_OPERATION_MAP_CLEANUP);
+        CHECK(key >= 1);
+        CHECK(key <= entry_count);
+        CHECK(value == key * 10);
+        CHECK(reported_keys.insert(key).second);
+    }
+    REQUIRE(reported_keys.size() == entry_count);
+
+    provider.set_probe_map(nullptr);
+}
+
+TEST_CASE("custom_map_cleanup_deprecated_pre_delete_unchanged", "[execution_context][custom_map_provider]")
+{
+    // Cleanup for a deprecated pre-delete provider keeps notifying before removal, using the historical iterator
+    // walk. This is the control that proves the cleanup change is selected by callback semantics.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    custom_map_test_provider_t provider;
+    REQUIRE(
+        provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, CUSTOM_MAP_TEST_SHAPE_DEPRECATED_PRE_DELETE, false) ==
+        EBPF_SUCCESS);
+
+    map_ptr map;
+    _create_custom_test_map(BPF_MAP_TYPE_SAMPLE_HASH_MAP, map);
+    provider.set_probe_map(map.get());
+
+    const uint32_t entry_count = 3;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        REQUIRE(_update_uint32_entry(map.get(), i + 1, (i + 1) * 10) == EBPF_SUCCESS);
+    }
+    provider.reset_observations();
+
+    map.reset();
+    _wait_for_map_teardown(provider, 1);
+
+    REQUIRE(provider.delete_element_count() == entry_count);
+    REQUIRE(provider.cleanup_probe_present() == entry_count);
+    REQUIRE(provider.cleanup_probe_absent() == 0);
+
+    provider.set_probe_map(nullptr);
+}
+
+TEST_CASE("ebpf_program_reference_maps_by_type", "[execution_context][custom_map_provider]")
+{
+    // Attach-time map enumeration (design section 8.2). The binding context handed to a map/hook provider at attach
+    // is an ebpf_link_t*, so the API resolves the attached program from the link, filters the program's associated
+    // maps by type, and hands back one reference per match.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    custom_map_test_provider_t cpumap_provider;
+    REQUIRE(
+        cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) ==
+        EBPF_SUCCESS);
+
+    map_ptr cpumap_a;
+    map_ptr cpumap_b;
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap_a);
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap_b);
+
+    // A built-in map of a different type must be filtered out.
+    map_ptr hash_map;
+    {
+        ebpf_map_definition_in_memory_t definition{BPF_MAP_TYPE_HASH, sizeof(uint32_t), sizeof(uint32_t), 8};
+        cxplat_utf8_string_t map_name = {0};
+        ebpf_map_t* local_map = nullptr;
+        REQUIRE(ebpf_map_create(&map_name, &definition, (uintptr_t)ebpf_handle_invalid, &local_map) == EBPF_SUCCESS);
+        hash_map.reset(local_map);
+    }
+
+    const cxplat_utf8_string_t program_name{(uint8_t*)("cpumap_program"), 14};
+    const cxplat_utf8_string_t section_name{(uint8_t*)("sample"), 6};
+    const ebpf_program_parameters_t program_parameters{
+        EBPF_PROGRAM_TYPE_SAMPLE, EBPF_ATTACH_TYPE_SAMPLE, program_name, section_name};
+    program_ptr program;
+    {
+        ebpf_program_t* local_program = nullptr;
+        REQUIRE(ebpf_program_create(&program_parameters, &local_program) == EBPF_SUCCESS);
+        program.reset(local_program);
+    }
+
+    ebpf_map_t* associated_maps[] = {hash_map.get(), cpumap_a.get(), cpumap_b.get()};
+    REQUIRE(
+        ebpf_program_associate_maps(program.get(), associated_maps, EBPF_COUNT_OF(associated_maps)) == EBPF_SUCCESS);
+
+    single_instance_hook_t hook(EBPF_PROGRAM_TYPE_SAMPLE, EBPF_ATTACH_TYPE_SAMPLE);
+    REQUIRE(hook.initialize() == EBPF_SUCCESS);
+
+    link_ptr link;
+    {
+        ebpf_link_t* local_link = nullptr;
+        REQUIRE(ebpf_link_create(EBPF_ATTACH_TYPE_SAMPLE, nullptr, 0, &local_link) == EBPF_SUCCESS);
+        link.reset(local_link);
+    }
+
+    uint32_t map_count = 0;
+    ebpf_map_provider_reference_t references[4] = {};
+
+    int64_t cpumap_a_references = 0;
+    int64_t cpumap_b_references = 0;
+    auto snapshot_reference_counts = [&]() {
+        cpumap_a_references = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+        cpumap_b_references = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+    };
+
+    // Every call below is followed by an unconditional release of the whole buffer, before the result is asserted.
+    // A regression that wrongly hands out references on a failure path would otherwise leak a map reference, and NMR
+    // provider deregistration at test teardown waits (untimed) for the map's client binding to go away: the test
+    // would hang instead of failing. Releasing first turns any such regression into a fast, readable failure.
+    auto release_all_references = [&references]() {
+        for (ebpf_map_provider_reference_t& reference : references) {
+            ebpf_map_release_provider_reference(&reference);
+            reference = {};
+        }
+    };
+
+    ebpf_result_t result = EBPF_SUCCESS;
+
+    // A link with no program attached cannot resolve a program.
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, nullptr, &map_count);
+    release_all_references();
+    REQUIRE(result == EBPF_INVALID_OBJECT);
+
+    REQUIRE(ebpf_link_attach_program(link.get(), program.get()) == EBPF_SUCCESS);
+
+    // Argument validation.
+    result = ebpf_program_reference_maps_by_type(nullptr, BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    release_all_references();
+    REQUIRE(result == EBPF_INVALID_ARGUMENT);
+
+    map_count = EBPF_COUNT_OF(references);
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, nullptr);
+    release_all_references();
+    REQUIRE(result == EBPF_INVALID_ARGUMENT);
+
+    // A non-link object must be rejected rather than reinterpreted.
+    map_count = EBPF_COUNT_OF(references);
+    result = ebpf_program_reference_maps_by_type(cpumap_a.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    release_all_references();
+    REQUIRE(result == EBPF_INVALID_OBJECT);
+
+    // No map of the requested type is associated.
+    map_count = EBPF_COUNT_OF(references);
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_XSKMAP, references, &map_count);
+    uint32_t reported_count = map_count;
+    release_all_references();
+    REQUIRE(result == EBPF_KEY_NOT_FOUND);
+    REQUIRE(reported_count == 0);
+
+    snapshot_reference_counts();
+
+    // Pass 1 of the two-pass sizing protocol: a NULL buffer reports the required count and takes no reference.
+    map_count = 0;
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, nullptr, &map_count);
+    reported_count = map_count;
+    int64_t cpumap_a_after = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+    int64_t cpumap_b_after = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+    release_all_references();
+    REQUIRE(result == EBPF_INSUFFICIENT_BUFFER);
+    REQUIRE(reported_count == 2);
+    REQUIRE(cpumap_a_after == cpumap_a_references);
+    REQUIRE(cpumap_b_after == cpumap_b_references);
+
+    // A buffer that is too small behaves the same way: required count reported, nothing referenced.
+    map_count = 1;
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    reported_count = map_count;
+    cpumap_a_after = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+    cpumap_b_after = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+    release_all_references();
+    REQUIRE(result == EBPF_INSUFFICIENT_BUFFER);
+    REQUIRE(reported_count == 2);
+    REQUIRE(cpumap_a_after == cpumap_a_references);
+    REQUIRE(cpumap_b_after == cpumap_b_references);
+
+    // Pass 2: an adequately sized buffer receives one reference per matching map.
+    map_count = EBPF_COUNT_OF(references);
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    reported_count = map_count;
+    cpumap_a_after = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+    cpumap_b_after = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+    std::vector<ebpf_map_provider_reference_t> returned(references, references + EBPF_COUNT_OF(references));
+    release_all_references();
+
+    REQUIRE(result == EBPF_SUCCESS);
+    REQUIRE(reported_count == 2);
+    REQUIRE(cpumap_a_after == cpumap_a_references + 1);
+    REQUIRE(cpumap_b_after == cpumap_b_references + 1);
+
+    // Releasing returns the reference counts to their original values.
+    REQUIRE(((ebpf_core_object_t*)cpumap_a.get())->base.reference_count == cpumap_a_references);
+    REQUIRE(((ebpf_core_object_t*)cpumap_b.get())->base.reference_count == cpumap_b_references);
+
+    std::set<const void*> referenced_maps;
+    for (uint32_t i = 0; i < reported_count; i++) {
+        CHECK(returned[i].map_type == BPF_MAP_TYPE_CPUMAP);
+        CHECK(returned[i].map_object != nullptr);
+        CHECK(returned[i].provider_map_context != nullptr);
+        CHECK(returned[i].map_object != hash_map.get());
+        CHECK(referenced_maps.insert(returned[i].map_object).second);
+    }
+    REQUIRE(referenced_maps.find(cpumap_a.get()) != referenced_maps.end());
+    REQUIRE(referenced_maps.find(cpumap_b.get()) != referenced_maps.end());
+
+    // Releasing a NULL or an all-zero reference is a no-op rather than a crash.
+    ebpf_map_release_provider_reference(nullptr);
+    ebpf_map_provider_reference_t empty_reference = {};
+    ebpf_map_release_provider_reference(&empty_reference);
+
+    // After detach the link no longer resolves a program, so attach-time enumeration is not possible.
+    ebpf_link_detach_program(link.get());
+    map_count = EBPF_COUNT_OF(references);
+    result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    release_all_references();
+    REQUIRE(result == EBPF_INVALID_OBJECT);
+}

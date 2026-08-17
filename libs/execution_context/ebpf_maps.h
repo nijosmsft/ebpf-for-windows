@@ -6,6 +6,7 @@
 #include "bpf_helpers.h"
 #include "cxplat.h"
 #include "ebpf_core_structs.h"
+#include "ebpf_extension.h"
 #include "ebpf_platform.h"
 
 #ifdef __cplusplus
@@ -468,6 +469,34 @@ extern "C"
      */
     _Must_inspect_result_ ebpf_result_t
     ebpf_map_get_value_address(_In_ const ebpf_map_t* map, _Out_ uintptr_t* value_address);
+
+    /**
+     * @brief Acquire a provider reference on a custom map of the given type.
+     *
+     * Runtime-internal building block for ebpf_program_reference_maps_by_type. Validates that @p map is a live custom
+     * map of @p expected_map_type, takes an object reference on it, and publishes the provider's per-map context.
+     * Never calls provider callbacks, never allocates and never waits.
+     *
+     * @param[in] map The map to reference.
+     * @param[in] expected_map_type The map type the caller requires.
+     * @param[out] map_reference Receives the reference on success, zeroed on failure.
+     * @retval EBPF_SUCCESS The reference was acquired.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+     * @retval EBPF_INVALID_OBJECT The object is not a live custom map of the expected type.
+     */
+    _IRQL_requires_max_(DISPATCH_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_map_acquire_provider_reference(
+        _In_opt_ const void* map,
+        ebpf_map_type_t expected_map_type,
+        _Out_ ebpf_map_provider_reference_t* map_reference);
+
+    /**
+     * @brief Release a single provider reference.
+     *
+     * @param[in] map_reference A reference returned by ebpf_program_reference_maps_by_type. Never calls provider
+     * callbacks and never waits.
+     */
+    _IRQL_requires_max_(DISPATCH_LEVEL) void ebpf_map_release_provider_reference(
+        _In_ const ebpf_map_provider_reference_t* map_reference);
 
 #ifdef __cplusplus
 }

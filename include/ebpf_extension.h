@@ -394,6 +394,20 @@ typedef struct _ebpf_map_provider_dispatch_table
 } ebpf_base_map_provider_dispatch_table_t;
 
 /**
+ * @brief A referenced custom-map handle used by trusted kernel extensions.
+ *
+ * Obtained from ebpf_program_reference_maps_by_type and released with ebpf_map_release_provider_reference. Holding
+ * the reference keeps the map object alive but intentionally does not expose the provider dispatch table or the NMR
+ * binding context to the caller.
+ */
+typedef struct _ebpf_map_provider_reference
+{
+    const void* map_object;     ///< Opaque referenced map object.
+    void* provider_map_context; ///< Provider's per-map context.
+    ebpf_map_type_t map_type;   ///< Map type of the referenced map.
+} ebpf_map_provider_reference_t;
+
+/**
  * @brief Allocate memory under epoch control.
  *
  * @param[in] size Size of memory to allocate.

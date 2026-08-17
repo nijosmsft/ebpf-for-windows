@@ -606,6 +606,29 @@ ebpf_link_get_info(
     EBPF_RETURN_RESULT(EBPF_SUCCESS);
 }
 
+_Must_inspect_result_ ebpf_result_t
+ebpf_link_reference_program(_Inout_ ebpf_link_t* link, _Outptr_ ebpf_program_t** program)
+{
+    EBPF_LOG_ENTRY();
+    if (link == NULL || program == NULL) {
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+    }
+    *program = NULL;
+
+    ebpf_result_t return_value = EBPF_SUCCESS;
+    ebpf_lock_state_t state = ebpf_lock_lock(&link->lock);
+    if (link->program == NULL) {
+        return_value = EBPF_INVALID_OBJECT;
+    } else {
+        // Take an object reference while holding the link lock so the program cannot be
+        // detached and freed out from under the caller. The caller owns this reference.
+        EBPF_OBJECT_ACQUIRE_REFERENCE((ebpf_core_object_t*)link->program);
+        *program = link->program;
+    }
+    ebpf_lock_unlock(&link->lock, state);
+    EBPF_RETURN_RESULT(return_value);
+}
+
 /**
  * @brief Set and validate the link state.
  *

@@ -176,6 +176,37 @@ extern "C"
     ebpf_program_associate_additional_map(ebpf_program_t* program, ebpf_map_t* map);
 
     /**
+     * @brief Reference every associated map of a given type for an attached eBPF program.
+     *
+     * Attach-time API used by trusted kernel extensions (for example, XDP) to obtain references to the custom maps of
+     * a given type that are associated with the program attached to a link, without ever exposing the provider
+     * dispatch table or the NMR binding context to the caller. Each returned reference must be released with
+     * ebpf_map_release_provider_reference.
+     *
+     * The binding context handed to a map/hook provider at attach time is an ebpf_link_t*, so the implementation
+     * resolves the attached program under link synchronization and holds a reference on it while enumerating.
+     *
+     * Two-pass sizing: call with maps == NULL (or a buffer that is too small) to learn the required count in
+     * map_count, then call again with a buffer of at least that size. map_count is always written with the number of
+     * matching maps, whether or not the buffer was large enough.
+     *
+     * @param[in] program_binding_context The link binding context supplied to the provider at attach.
+     * @param[in] map_type The map type to match.
+     * @param[out] maps Caller buffer receiving the references, or NULL to query the required count.
+     * @param[in,out] map_count On input, the capacity of @p maps. On output, the number of matching maps.
+     * @retval EBPF_SUCCESS All matching maps were referenced.
+     * @retval EBPF_INSUFFICIENT_BUFFER @p maps was NULL or too small; @p map_count holds the required count.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+     * @retval EBPF_INVALID_OBJECT The link, program, or a matching map is not valid.
+     * @retval EBPF_KEY_NOT_FOUND No map of the requested type is associated with the program.
+     */
+    _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_program_reference_maps_by_type(
+        _In_ const void* program_binding_context,
+        ebpf_map_type_t map_type,
+        _Out_writes_to_opt_(*map_count, *map_count) ebpf_map_provider_reference_t* maps,
+        _Inout_ uint32_t* map_count);
+
+    /**
      * @brief Load a block of eBPF code into the program instance.
      *
      * @param[in, out] program Program instance to load the eBPF code into.

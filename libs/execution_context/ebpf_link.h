@@ -71,6 +71,23 @@ extern "C"
         _Inout_ uint16_t* info_size);
 
     /**
+     * @brief Acquire a reference on the program currently attached to this link.
+     *
+     * Resolves the owning eBPF program from the link under link synchronization and takes an object reference on it.
+     * The caller owns the returned reference and must release it with EBPF_OBJECT_RELEASE_REFERENCE. This is the
+     * bridge used by extensions that are handed an ebpf_link_t* as their client binding context at attach time and
+     * need to inspect the maps associated with the attached program.
+     *
+     * @param[in] link The link object to resolve the program from.
+     * @param[out] program On success, receives a referenced pointer to the attached program.
+     * @retval EBPF_SUCCESS The operation was successful; caller owns a reference.
+     * @retval EBPF_INVALID_ARGUMENT link or program was NULL.
+     * @retval EBPF_INVALID_OBJECT The link currently has no attached program.
+     */
+    _Must_inspect_result_ ebpf_result_t
+    ebpf_link_reference_program(_Inout_ ebpf_link_t* link, _Outptr_ ebpf_program_t** program);
+
+    /**
      * @brief Mark the link as operating in legacy mode, which means that it doesn't
      * detach when the last user mode reference to the link is closed.
      *
