@@ -444,9 +444,39 @@ _apply_test_cpumap_provider_defect(test_cpumap_provider_defect_t defect)
     }
 }
 
+// Version 2 provider published for the (non-CPUMAP) sample hash map type with updates_original_value == FALSE.
+//
+// This is the exact shape that makes the PASSIVE_LEVEL-only version 2 mutation callbacks reachable from a BPF-program
+// (helper) operation: with updates_original_value == FALSE the runtime does NOT reject helper CRUD up front, so the
+// runtime itself must bypass the version 2 mutation admission/completion pair on the EBPF_MAP_FLAG_HELPER path. A
+// CPUMAP cannot be used to prove this, because locked item 9 forces updates_original_value == TRUE on CPUMAP. The
+// version 2 callbacks are shared with the CPUMAP mock, so the same observation counters apply.
+static ebpf_base_map_provider_dispatch_table_v2_t _test_v2_helper_map_dispatch_table_v2 = {
+    .header = EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V2_HEADER,
+    .preprocess_map_create = _test_cpumap_map_create,
+    .postprocess_map_delete = _test_cpumap_map_delete,
+    .preprocess_associate_program_type = _test_sample_map_associate_program,
+    .postprocess_map_find_element = _test_cpumap_find_element,
+    .preprocess_map_update_element = _test_cpumap_update_element,
+    .postprocess_map_delete_element = _test_cpumap_postprocess_delete_element,
+    .preprocess_map_mutation_v2 = _test_cpumap_preprocess_mutation_v2,
+    .postprocess_map_mutation_complete_v2 = _test_cpumap_postprocess_mutation_complete_v2,
+    .preprocess_map_activate = _test_cpumap_preprocess_map_activate,
+    .postprocess_map_deactivate = _test_cpumap_postprocess_map_deactivate,
+    .preprocess_map_delete_element_v2 = _test_cpumap_preprocess_map_delete_element_v2};
+
+static ebpf_base_map_provider_properties_t _test_v2_helper_map_provider_properties = {
+    EBPF_BASE_MAP_PROVIDER_PROPERTIES_HEADER, false};
+
+static ebpf_map_provider_data_t _test_v2_helper_map_provider_data = {
+    EBPF_MAP_PROVIDER_DATA_HEADER,
+    BPF_MAP_TYPE_SAMPLE_HASH_MAP,
+    BPF_MAP_TYPE_HASH,
+    &_test_v2_helper_map_provider_properties,
+    (ebpf_base_map_provider_dispatch_table_t*)&_test_v2_helper_map_dispatch_table_v2};
+
 typedef class _test_sample_map_provider
 {
-    // Map provider implementation
   public:
     ~_test_sample_map_provider() { deregister(); }
 
@@ -541,6 +571,20 @@ typedef class _test_sample_map_provider
         }
 
         // Register as NMR provider
+        NTSTATUS status = NmrRegisterProvider(&_map_provider_characteristics, this, &_map_provider_handle);
+        return NT_SUCCESS(status) ? EBPF_SUCCESS : EBPF_FAILED;
+    }
+
+    // Register a version 2 provider for the (non-CPUMAP) sample hash map type with updates_original_value == FALSE.
+    // See _test_v2_helper_map_provider_data for why this combination is the one that can expose the PASSIVE-only
+    // version 2 mutation callbacks to a BPF-program (helper) operation.
+    ebpf_result_t
+    initialize_v2_provider_without_updates_original_value()
+    {
+        _object_map = false;
+        _test_v2_helper_map_provider_properties.updates_original_value = false;
+        _map_provider_characteristics.ProviderRegistrationInstance.NpiSpecificCharacteristics =
+            &_test_v2_helper_map_provider_data;
         NTSTATUS status = NmrRegisterProvider(&_map_provider_characteristics, this, &_map_provider_handle);
         return NT_SUCCESS(status) ? EBPF_SUCCESS : EBPF_FAILED;
     }

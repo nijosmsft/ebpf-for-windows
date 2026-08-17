@@ -2852,6 +2852,21 @@ _create_cpumap_map(
     return local_map;
 }
 
+// Create a CPUMAP map bound to the supplied (already-initialized) mock provider, returning the result instead of
+// requiring success. Used by the malformed-provider negative tests, where creation MUST fail.
+static ebpf_result_t
+_try_create_cpumap_map(
+    _Outptr_result_maybenull_ ebpf_map_t** map,
+    uint32_t key_size = sizeof(uint32_t),
+    uint32_t value_size = sizeof(uint32_t),
+    uint32_t max_entries = 4)
+{
+    ebpf_map_definition_in_memory_t map_definition{BPF_MAP_TYPE_CPUMAP, key_size, value_size, max_entries};
+    cxplat_utf8_string_t map_name = {0};
+    *map = nullptr;
+    return ebpf_map_create(&map_name, &map_definition, (uintptr_t)ebpf_handle_invalid, map);
+}
+
 TEST_CASE("cpumap_runtime_api_negatives", "[cpumap][negative]")
 {
     _ebpf_core_initializer core;
@@ -3312,4 +3327,180 @@ TEST_CASE("cpumap_bpf_program_crud_rejection", "[cpumap][negative]")
     // The rejection happens before admission, so the provider must not have admitted or completed any mutation.
     REQUIRE(cpumap_provider.mutation_admit_count() == 0);
     REQUIRE(cpumap_provider.mutation_complete_count() == 0);
+}
+
+TEST_CASE("cpumap_malformed_provider_rejected", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    // Each defect violates exactly one locked CPUMAP provider requirement (design section 17.2). CPUMAP creation must
+    // fail for every one of them, either in the generic version 2 dispatch-table validation (shared_common.c) or in
+    // the CPUMAP-specific attach-time contract check (_ebpf_validate_cpumap_provider_requirements). Without these
+    // negatives the validation code has no proof that it rejects anything.
+    struct defect_case
+    {
+        test_cpumap_provider_defect_t defect;
+        const char* description;
+    };
+
+    static const defect_case defect_cases[] = {
+        {TEST_CPUMAP_DEFECT_UPDATES_ORIGINAL_FALSE, "updates_original_value == FALSE (item 9)"},
+        {TEST_CPUMAP_DEFECT_V1_TABLE, "version 1 dispatch table (item 4)"},
+        {TEST_CPUMAP_DEFECT_MISSING_ACTIVATE, "NULL activate/deactivate pair (item 4)"},
+        {TEST_CPUMAP_DEFECT_MISSING_MUTATION, "NULL mutation gate/completion pair (item 4)"},
+        {TEST_CPUMAP_DEFECT_MISSING_REJECTABLE_DELETE, "NULL rejectable delete v2 (item 4/8)"},
+        {TEST_CPUMAP_DEFECT_MISSING_POSTPROCESS_DELETE, "NULL non-rejectable post-delete (item 8)"},
+        {TEST_CPUMAP_DEFECT_DEPRECATED_PREDELETE_SET, "deprecated pre-delete slot set (item 8)"},
+    };
+
+    for (const defect_case& test_case : defect_cases) {
+        CAPTURE(test_case.description);
+
+        test_sample_map_provider_t defective_provider;
+        REQUIRE(
+            defective_provider.initialize(BPF_MAP_TYPE_CPUMAP, false, true, true, test_case.defect) == EBPF_SUCCESS);
+
+        ebpf_map_t* local_map = nullptr;
+        ebpf_result_t create_result = _try_create_cpumap_map(&local_map);
+
+        // Take ownership of any unexpectedly-created map before asserting. Declared after the provider so it is
+        // destroyed first, including during exception unwind from a failed REQUIRE. Without this, a regression would
+        // leak the map and then deadlock: NMR provider deregistration in the provider destructor waits untimed for the
+        // map's client binding to be torn down, and that only happens when the map is freed.
+        map_ptr unexpected_map;
+        unexpected_map.reset(local_map);
+
+        // CHECK (not REQUIRE) so every defect is evaluated and reported independently: one failing variant must not
+        // mask the other six.
+        CHECK(create_result != EBPF_SUCCESS);
+        CHECK(local_map == nullptr);
+
+        // A rejected provider must never have been asked to create provider-side map state.
+        CHECK(defective_provider.mutation_admit_count() == 0);
+        CHECK(defective_provider.activate_count() == 0);
+    }
+
+    // Success control: after every malformed variant, a compliant version 2 provider must still create a working
+    // CPUMAP. This proves the rejections above are attributable to the defects and that no defect leaked into the
+    // shared provider state.
+    test_sample_map_provider_t compliant_provider;
+    REQUIRE(
+        compliant_provider.initialize(BPF_MAP_TYPE_CPUMAP, false, true, true, TEST_CPUMAP_DEFECT_NONE) == EBPF_SUCCESS);
+
+    map_ptr compliant_map;
+    {
+        ebpf_map_t* local_map = nullptr;
+        REQUIRE(_try_create_cpumap_map(&local_map) == EBPF_SUCCESS);
+        REQUIRE(local_map != nullptr);
+        compliant_map.reset(local_map);
+    }
+
+    // The compliant map is fully functional: the version 2 mutation gate runs and completes.
+    uint32_t key = 2;
+    uint32_t value = 200;
+    REQUIRE(
+        ebpf_map_update_entry(
+            compliant_map.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(value),
+            (const uint8_t*)&value,
+            EBPF_ANY,
+            0) == EBPF_SUCCESS);
+    REQUIRE(compliant_provider.mutation_admit_count() == 1);
+    REQUIRE(compliant_provider.mutation_complete_count() == 1);
+    REQUIRE(compliant_provider.last_completion() == EBPF_MAP_MUTATION_COMPLETION_COMMIT);
+}
+
+TEST_CASE("custom_map_v2_mutation_gate_not_reachable_from_helper", "[cpumap][negative]")
+{
+    _ebpf_core_initializer core;
+    core.initialize();
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    // The version 2 mutation admission/completion callbacks are PASSIVE_LEVEL-only, but a BPF-program (helper)
+    // operation can run at DISPATCH_LEVEL. CPUMAP is protected by the locked updates_original_value == TRUE
+    // requirement, which rejects helper CRUD outright -- so CPUMAP cannot prove the runtime's own gate is correct.
+    // This provider publishes the same version 2 table for a NON-CPUMAP map type with updates_original_value ==
+    // FALSE, which is exactly the generic case where helper CRUD does reach the custom-map update/delete paths.
+    test_sample_map_provider_t v2_provider;
+    REQUIRE(v2_provider.initialize_v2_provider_without_updates_original_value() == EBPF_SUCCESS);
+
+    map_ptr v2_map;
+    {
+        ebpf_map_definition_in_memory_t map_definition{
+            BPF_MAP_TYPE_SAMPLE_HASH_MAP, sizeof(uint32_t), sizeof(uint32_t), 4};
+        cxplat_utf8_string_t map_name = {0};
+        ebpf_map_t* local_map = nullptr;
+        REQUIRE(
+            ebpf_map_create(&map_name, &map_definition, (uintptr_t)ebpf_handle_invalid, &local_map) == EBPF_SUCCESS);
+        v2_map.reset(local_map);
+    }
+
+    uint32_t key = 11;
+    uint32_t user_value = 1100;
+    uint32_t read_back = 0;
+
+    // Control: a user-mode (non-helper) update runs the version 2 mutation gate exactly once.
+    REQUIRE(
+        ebpf_map_update_entry(
+            v2_map.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(user_value),
+            (const uint8_t*)&user_value,
+            EBPF_ANY,
+            0) == EBPF_SUCCESS);
+    REQUIRE(v2_provider.mutation_admit_count() == 1);
+    REQUIRE(v2_provider.mutation_complete_count() == 1);
+
+    // Helper update: the operation itself must still work (that is the documented version 1 behavior for a provider
+    // with updates_original_value == FALSE), but it must NOT invoke the PASSIVE-only version 2 mutation callbacks.
+    uint32_t helper_value = 2200;
+    REQUIRE(
+        ebpf_map_update_entry(
+            v2_map.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(helper_value),
+            (const uint8_t*)&helper_value,
+            EBPF_ANY,
+            EBPF_MAP_FLAG_HELPER) == EBPF_SUCCESS);
+    REQUIRE(v2_provider.mutation_admit_count() == 1);
+    REQUIRE(v2_provider.mutation_complete_count() == 1);
+
+    // The helper update really did reach the base map, so the bypass skipped only the mutation gate.
+    REQUIRE(
+        ebpf_map_find_entry(
+            v2_map.get(), sizeof(key), (const uint8_t*)&key, sizeof(read_back), (uint8_t*)&read_back, 0) ==
+        EBPF_SUCCESS);
+    REQUIRE(read_back == helper_value);
+
+    // Helper delete: same contract.
+    REQUIRE(
+        ebpf_map_delete_entry(v2_map.get(), sizeof(key), (const uint8_t*)&key, EBPF_MAP_FLAG_HELPER) == EBPF_SUCCESS);
+    REQUIRE(v2_provider.mutation_admit_count() == 1);
+    REQUIRE(v2_provider.mutation_complete_count() == 1);
+    REQUIRE(
+        ebpf_map_find_entry(
+            v2_map.get(), sizeof(key), (const uint8_t*)&key, sizeof(read_back), (uint8_t*)&read_back, 0) !=
+        EBPF_SUCCESS);
+
+    // A subsequent user-mode mutation is still gated, proving the bypass is scoped to helper operations only.
+    REQUIRE(
+        ebpf_map_update_entry(
+            v2_map.get(),
+            sizeof(key),
+            (const uint8_t*)&key,
+            sizeof(user_value),
+            (const uint8_t*)&user_value,
+            EBPF_ANY,
+            0) == EBPF_SUCCESS);
+    REQUIRE(v2_provider.mutation_admit_count() == 2);
+    REQUIRE(v2_provider.mutation_complete_count() == 2);
+    REQUIRE(v2_provider.mutation_token_roundtrip_ok());
 }

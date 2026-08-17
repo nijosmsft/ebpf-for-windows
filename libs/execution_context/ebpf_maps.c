@@ -4523,6 +4523,15 @@ typedef struct _ebpf_custom_map
     size_t actual_value_size;
     uint32_t provider_flags;
     EX_RUNDOWN_REF provider_rundown_reference; // Synchronization for provider access.
+
+    // Snapshot buffers used exclusively by the version 2 map-cleanup path (design section 8.5). They are provisioned
+    // during map creation - and map creation fails if they cannot be allocated - so that cleanup is allocation-free.
+    // Cleanup removes each element from the base map with the hash-table free notification suppressed and notifies the
+    // provider afterwards, outside the map lock; an allocation there could fail during low-memory teardown and would
+    // silently drop the provider's post-removal notification, leaking its per-entry state. Both pointers are NULL for
+    // version 1 maps, which keep their notify-before-removal cleanup and never read these buffers.
+    uint8_t* cleanup_key_snapshot;
+    uint8_t* cleanup_value_snapshot;
 } ebpf_custom_map_t;
 
 /**
@@ -4647,6 +4656,10 @@ _ebpf_custom_map_delete(_In_ _Post_ptr_invalid_ ebpf_custom_map_t* map)
 
     ebpf_lock_destroy(&map->lock);
     ebpf_free_cache_aligned(map->provider_dispatch);
+    // Unconditional and NULL-safe: this is the single teardown path for a custom map (both the map-creation failure
+    // path and ebpf_custom_map_delete funnel here), so each provisioned snapshot buffer is freed exactly once.
+    ebpf_free(map->cleanup_key_snapshot);
+    ebpf_free(map->cleanup_value_snapshot);
     ebpf_free(map->core_map.name.value);
     ebpf_free_cache_aligned(map);
 }
@@ -4692,10 +4705,24 @@ _clean_up_custom_hash_map(_Inout_ ebpf_custom_map_t* map)
         // push lock during cleanup without risking a lock-order inversion or a bugcheck. Snapshot each element, remove
         // it under the lock (the hash-table's own free notification is suppressed via a NULL operation context), then
         // notify the provider once the lock is dropped.
+        //
+        // This loop is deliberately allocation-free. The snapshot buffers were provisioned at map creation, which
+        // fails if they cannot be allocated, so there is no path in which an element is removed from the base map
+        // while its post-removal notification is skipped. That failure mode would leak provider per-entry state
+        // exactly when it hurts most: low-memory teardown.
         uint32_t key_size = core_map->ebpf_map_definition.key_size;
         size_t value_size = map->actual_value_size;
-        uint8_t* key_copy = (uint8_t*)ebpf_allocate_with_tag(key_size, EBPF_POOL_TAG_CUSTOM_MAP);
-        uint8_t* value_copy = (uint8_t*)ebpf_allocate_with_tag(value_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        uint8_t* key_copy = map->cleanup_key_snapshot;
+        uint8_t* value_copy = map->cleanup_value_snapshot;
+        ebpf_assert(key_copy != NULL && value_copy != NULL);
+        __analysis_assume(key_copy != NULL);
+        __analysis_assume(value_copy != NULL);
+
+        // Fixed for the map's lifetime: the dispatch table is captured at attach and never republished. Version 2
+        // validation additionally requires postprocess_map_delete_element, so this is always true for a version 2
+        // provider; it is retained as a defensive guard only.
+        bool notify_provider = HAS_DELETE_ELEMENT_CALLBACK(map->provider_dispatch);
+
         for (;;) {
             ebpf_lock_state_t lock_state = ebpf_lock_lock(&map->lock);
             uint8_t* first_key = NULL;
@@ -4706,17 +4733,15 @@ _clean_up_custom_hash_map(_Inout_ ebpf_custom_map_t* map)
                 ebpf_lock_unlock(&map->lock, lock_state);
                 break;
             }
-            bool notify = false;
-            if (key_copy != NULL && value_copy != NULL && HAS_DELETE_ELEMENT_CALLBACK(map->provider_dispatch)) {
+            if (notify_provider) {
                 memcpy(key_copy, first_key, key_size);
                 memcpy(value_copy, value, value_size);
-                notify = true;
             }
             ebpf_assert_success(ebpf_hash_table_delete((ebpf_hash_table_t*)core_map->data, NULL, first_key));
             ebpf_lock_unlock(&map->lock, lock_state);
 
-            if (notify) {
-                // Post-removal, outside the map lock.
+            if (notify_provider) {
+                // Post-removal, outside the map lock. Reached for every removed element.
                 _invoke_delete_element_callback(
                     map->provider_dispatch,
                     map->provider_context,
@@ -4729,8 +4754,6 @@ _clean_up_custom_hash_map(_Inout_ ebpf_custom_map_t* map)
             }
         }
         ebpf_assert(ebpf_hash_table_key_count((ebpf_hash_table_t*)core_map->data) == 0);
-        ebpf_free(key_copy);
-        ebpf_free(value_copy);
         return;
     }
 
@@ -4827,6 +4850,14 @@ _ebpf_custom_map_update_hash_map_entry(
     ebpf_custom_map_t* custom_map = EBPF_FROM_FIELD(ebpf_custom_map_t, core_map, map);
     const ebpf_base_map_provider_dispatch_table_v2_t* dispatch_v2 = _ebpf_custom_map_provider_dispatch_v2(custom_map);
 
+    // The version 2 mutation admission and completion callbacks are PASSIVE_LEVEL-only (see ebpf_extension.h) and are
+    // contractually never invoked for BPF-program (helper) operations, which may run at DISPATCH_LEVEL. CPUMAP is
+    // additionally required to set updates_original_value == TRUE, which rejects helper CRUD outright, but the version
+    // 2 dispatch table is generic infrastructure: a version 2 provider with updates_original_value == FALSE still
+    // reaches this function from a helper. Gate the whole version 2 mutation pair on the caller not being a helper so
+    // the IRQL contract holds independently of any single provider's properties.
+    bool v2_mutation_gate_applies = (dispatch_v2 != NULL) && !(flags & EBPF_MAP_FLAG_HELPER);
+
     if (UPDATE_ORIGINAL_VALUE_FLAG_PRESENT(custom_map->provider_flags)) {
         // If provider updates original value, allocate a local buffer to hold the new value.
         // Note that this code path is only valid for update from user mode, not in hot path (e.g., helper calls).
@@ -4840,8 +4871,8 @@ _ebpf_custom_map_update_hash_map_entry(
     // Version 2 mutation admission gate. The provider owns the gate state (admission-closed / in-flight count); the
     // runtime only asks permission here. On admission (a non-NULL token), the runtime guarantees exactly one matching
     // completion call below, regardless of which later step fails. If admission is refused, the base map is left
-    // untouched and no completion is owed.
-    if (dispatch_v2 != NULL && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
+    // untouched and no completion is owed. Helper operations bypass the gate entirely (see v2_mutation_gate_applies).
+    if (v2_mutation_gate_applies && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
         provider_flags = _get_provider_flags(flags, true);
         result = dispatch_v2->preprocess_map_mutation_v2(
             custom_map->provider_context,
@@ -4909,7 +4940,7 @@ _ebpf_custom_map_update_hash_map_entry(
     }
 
 Complete:
-    if (mutation_admitted && dispatch_v2 != NULL && dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
+    if (mutation_admitted && v2_mutation_gate_applies && dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
         // Exactly one completion per admitted token. The value reported reflects what the base map holds/attempted.
         const uint8_t* completion_value = out_value ? out_value : value;
         provider_flags = _get_provider_flags(flags, true);
@@ -5122,6 +5153,44 @@ ebpf_custom_map_create(
     bool pre_free_notification_supported =
         !provider_is_v2 && custom_map->provider_dispatch->preprocess_map_update_element != NULL;
 
+    if (provider_is_v2) {
+        // Provision the version 2 cleanup snapshot buffers here so that map teardown is allocation-free. Map cleanup
+        // removes each element from the base map with the hash-table free notification suppressed and notifies the
+        // provider afterwards, outside the map lock (design section 8.5). If that snapshot had to be allocated during
+        // teardown, an allocation failure would delete the element without ever delivering
+        // postprocess_map_delete_element, leaking the provider's per-entry state. Failing map creation instead keeps
+        // the post-removal notification unconditional for the map's whole lifetime.
+        //
+        // Buffers are provisioned only for version 2 maps: the version 1 cleanup path notifies before removal and
+        // never reads them, so allocating for version 1 would add cost with no consumer. The version 2 predicate is
+        // evaluated from the dispatch table captured at attach, which is fixed for the map's lifetime, so it is
+        // identical here and in _clean_up_custom_hash_map.
+        if (map_definition->key_size == 0) {
+            // A version 2 map must be able to snapshot its key during cleanup.
+            EBPF_LOG_MESSAGE_UINT64(
+                EBPF_TRACELOG_LEVEL_ERROR,
+                EBPF_TRACELOG_KEYWORD_MAP,
+                "Version 2 custom map requires a non-zero key size",
+                custom_map->core_map.ebpf_map_definition.type);
+            result = EBPF_INVALID_ARGUMENT;
+            goto Done;
+        }
+
+        custom_map->cleanup_key_snapshot =
+            (uint8_t*)ebpf_allocate_with_tag(map_definition->key_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        custom_map->cleanup_value_snapshot =
+            (uint8_t*)ebpf_allocate_with_tag(actual_value_size, EBPF_POOL_TAG_CUSTOM_MAP);
+        if (custom_map->cleanup_key_snapshot == NULL || custom_map->cleanup_value_snapshot == NULL) {
+            EBPF_LOG_MESSAGE_UINT64(
+                EBPF_TRACELOG_LEVEL_ERROR,
+                EBPF_TRACELOG_KEYWORD_MAP,
+                "Failed to allocate cleanup snapshot buffers for custom map type",
+                custom_map->core_map.ebpf_map_definition.type);
+            result = EBPF_NO_MEMORY;
+            goto Done;
+        }
+    }
+
     // Create hash map.
     result = _ebpf_custom_map_create_hash_map(
         map_definition, actual_value_size, pre_free_notification_supported, &custom_map->core_map);
@@ -5302,7 +5371,7 @@ _ebpf_custom_map_client_attach_provider(
             "NmrClientAttachProvider failed for custom map",
             status);
 
-        ebpf_free((void*)custom_map->provider_dispatch);
+        ebpf_free_cache_aligned((void*)custom_map->provider_dispatch);
         custom_map->provider_dispatch = NULL;
         goto Done;
     } else {
@@ -5317,7 +5386,10 @@ Done:
         ebpf_lock_unlock(&custom_map->lock, state);
     }
 
-    ebpf_free(provider_dispatch_table);
+    // The dispatch-table copy is cache-aligned, so it must be released with the matching cache-aligned free. This is
+    // reachable whenever attach rejects the provider (including the CPUMAP contract rejection above); freeing it with
+    // the plain allocator would mismatch the pool flags and corrupt the allocation.
+    ebpf_free_cache_aligned(provider_dispatch_table);
     return status;
 }
 
@@ -5492,6 +5564,9 @@ ebpf_custom_map_delete_entry(_In_ ebpf_map_t* map, size_t key_size, _In_reads_(k
     if (custom_map->base_map_type == BPF_MAP_TYPE_HASH) {
         const ebpf_base_map_provider_dispatch_table_v2_t* dispatch_v2 =
             _ebpf_custom_map_provider_dispatch_v2(custom_map);
+        // Same PASSIVE_LEVEL-only contract as the update path: the version 2 mutation admission and completion
+        // callbacks are never invoked for BPF-program (helper) operations, which may run at DISPATCH_LEVEL.
+        bool v2_mutation_gate_applies = (dispatch_v2 != NULL) && !(flags & EBPF_MAP_FLAG_HELPER);
         uint32_t provider_flags = _get_provider_flags(flags, false);
         void* mutation_token = NULL;
         bool mutation_admitted = false;
@@ -5502,7 +5577,7 @@ ebpf_custom_map_delete_entry(_In_ ebpf_map_t* map, size_t key_size, _In_reads_(k
 
         // Version 2 mutation admission gate for delete. Mirrors the update path: provider-owned gate, and any admitted
         // (non-NULL) token gets exactly one completion below.
-        if (dispatch_v2 != NULL && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
+        if (v2_mutation_gate_applies && dispatch_v2->preprocess_map_mutation_v2 != NULL) {
             result = dispatch_v2->preprocess_map_mutation_v2(
                 custom_map->provider_context,
                 custom_map->core_map.custom_map_context,
@@ -5541,7 +5616,8 @@ ebpf_custom_map_delete_entry(_In_ ebpf_map_t* map, size_t key_size, _In_reads_(k
             (result == EBPF_SUCCESS) ? EBPF_MAP_MUTATION_COMPLETION_COMMIT : EBPF_MAP_MUTATION_COMPLETION_ROLLBACK;
 
     Complete:
-        if (mutation_admitted && dispatch_v2 != NULL && dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
+        if (mutation_admitted && v2_mutation_gate_applies &&
+            dispatch_v2->postprocess_map_mutation_complete_v2 != NULL) {
             dispatch_v2->postprocess_map_mutation_complete_v2(
                 custom_map->provider_context,
                 custom_map->core_map.custom_map_context,

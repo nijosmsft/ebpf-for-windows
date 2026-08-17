@@ -456,7 +456,7 @@ typedef ebpf_result_t (*ebpf_preprocess_map_mutation_v2_t)(
  * @param[in] value Pointer to the provider's stored value buffer, or NULL for delete.
  * @param[in] flags Operation flags (see EBPF_MAP_OPERATION_*).
  *
- * IRQL: PASSIVE_LEVEL.
+ * IRQL: PASSIVE_LEVEL. This callback is never invoked for BPF-program (helper) operations.
  */
 typedef void (*ebpf_postprocess_map_mutation_complete_v2_t)(
     _In_ void* binding_context,
