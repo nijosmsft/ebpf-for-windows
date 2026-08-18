@@ -157,7 +157,25 @@ size_t _ebpf_map_provider_properties_supported_size[] = {EBPF_BASE_MAP_PROVIDER_
 
 #define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_0 \
     EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_client_dispatch_table_t, epoch_free_cache_aligned)
-size_t _ebpf_map_client_dispatch_table_supported_size[] = {EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_0};
+#define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_1 \
+    EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_client_dispatch_table_t, map_release_provider_reference)
+size_t _ebpf_map_client_dispatch_table_supported_size[] = {
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_0, EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_1};
+
+// The client dispatch table is append-only and its version is not bumped for an append, so each historical size is
+// recorded here alongside the current one. Note that nothing in the runtime currently validates a client dispatch
+// table header: this list is consistency metadata for the shared validation machinery, kept in step with the provider
+// dispatch table's list, and is inert until a consumer or a future runtime self-check uses it. The guards below fail
+// the build if a member is appended without recording its size, so the list cannot silently drift.
+static_assert(
+    EBPF_COUNT_OF(_ebpf_map_client_dispatch_table_supported_size) == 2,
+    "Appending to ebpf_base_map_client_dispatch_table_t requires recording the new size in the supported list.");
+static_assert(
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_1 == EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE,
+    "The last recorded client dispatch table size must be the current version size.");
+static_assert(
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_0 < EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_SIZE_1,
+    "Client dispatch table sizes must be recorded oldest first and must be distinct.");
 
 struct _ebpf_extension_data_structure_supported_sizes
 {

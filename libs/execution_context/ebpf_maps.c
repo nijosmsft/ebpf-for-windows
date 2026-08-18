@@ -4457,7 +4457,11 @@ static ebpf_base_map_client_dispatch_table_t _ebpf_custom_map_client_dispatch_ta
     ebpf_epoch_allocate_with_tag,
     ebpf_epoch_allocate_cache_aligned_with_tag,
     ebpf_epoch_free,
-    ebpf_epoch_free_cache_aligned};
+    ebpf_epoch_free_cache_aligned,
+    // Appended members. These are assigned without a cast so the compiler enforces that the published function
+    // pointers match the public typedefs exactly.
+    ebpf_program_reference_maps_by_type,
+    ebpf_map_release_provider_reference};
 
 static ebpf_map_type_t _supported_base_map_types[] = {BPF_MAP_TYPE_HASH};
 

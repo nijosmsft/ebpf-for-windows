@@ -2841,6 +2841,16 @@ typedef enum _custom_map_test_shape
 
 class custom_map_test_provider_t;
 
+// How much of the runtime's client dispatch table the mock consumer's own struct covers. This models the SDK the
+// consumer was built against: a provider compiled before a member was appended has a smaller local struct and copies
+// correspondingly fewer bytes.
+typedef enum _custom_map_test_client_table_view
+{
+    CUSTOM_MAP_TEST_CLIENT_TABLE_CURRENT = 0,  ///< Consumer and runtime are both current.
+    CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_CONSUMER, ///< Consumer predates the append: its own struct is smaller.
+    CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_RUNTIME,  ///< Current consumer bound to a runtime that predates the append.
+} custom_map_test_client_table_view_t;
+
 typedef struct _custom_map_test_map_context
 {
     custom_map_test_provider_t* provider;
@@ -3004,12 +3014,50 @@ class custom_map_test_provider_t
         _Outptr_result_maybenull_ const void** provider_dispatch)
     {
         UNREFERENCED_PARAMETER(nmr_binding_handle);
-        UNREFERENCED_PARAMETER(client_registration_instance);
         UNREFERENCED_PARAMETER(client_binding_context);
         UNREFERENCED_PARAMETER(client_dispatch);
+        custom_map_test_provider_t* provider = (custom_map_test_provider_t*)provider_context;
+        provider->capture_client_dispatch_table(
+            (const ebpf_map_client_data_t*)client_registration_instance->NpiSpecificCharacteristics);
         *provider_binding_context = provider_context;
         *provider_dispatch = nullptr;
         return STATUS_SUCCESS;
+    }
+
+    // Capture the runtime's client dispatch table exactly the way a real consumer does: a size-clamped copy into a
+    // zeroed local struct (xdp-for-windows src/xdp/ebpfxskmap.c:426-427 does
+    // RtlCopyMemory(&local, remote, min(sizeof(local), remote->header.total_size)) into an ExAllocatePoolZero
+    // allocation). _client_table_view lets a test simulate either side of the version skew.
+    //
+    // For OLD_RUNTIME the fixture synthesizes a genuine legacy table rather than merely truncating the copy. A real
+    // runtime that predates the append advertises the OLD size and total_size, so truncating the copy while keeping
+    // the current header would produce a table no runtime can emit -- current-version metadata with an absent tail --
+    // and would silently defeat header-size gating, which is the mechanism a real consumer uses to decide whether the
+    // appended members are present.
+    void
+    capture_client_dispatch_table(_In_ const ebpf_map_client_data_t* client_data)
+    {
+        const ebpf_base_map_client_dispatch_table_t* remote = client_data->base_client_table;
+
+        if (_client_table_view == CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_RUNTIME) {
+            memset(&_legacy_remote_table, 0, sizeof(_legacy_remote_table));
+            memcpy(&_legacy_remote_table, remote, EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0);
+            _legacy_remote_table.header.size = EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0;
+            _legacy_remote_table.header.total_size = EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0;
+            remote = &_legacy_remote_table;
+        }
+
+        _published_header = remote->header;
+
+        // Models the size of the CONSUMER'S OWN struct, i.e. the SDK it was built against.
+        size_t local_size = (_client_table_view == CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_CONSUMER)
+                                ? EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0
+                                : sizeof(ebpf_base_map_client_dispatch_table_t);
+
+        memset(&_client_dispatch_table, 0, sizeof(_client_dispatch_table));
+        _client_table_bytes_copied = (std::min)(local_size, (size_t)remote->header.total_size);
+        memcpy(&_client_dispatch_table, remote, _client_table_bytes_copied);
+        _client_table_captured = true;
     }
 
     static NTSTATUS
@@ -3023,6 +3071,45 @@ class custom_map_test_provider_t
     shape() const
     {
         return _shape;
+    }
+
+    // Must be set before the first map of this provider's type is created, because that is when the runtime attaches
+    // and publishes the client dispatch table.
+    void
+    set_client_table_view(custom_map_test_client_table_view_t view)
+    {
+        _client_table_view = view;
+    }
+
+    bool
+    client_table_captured() const
+    {
+        return _client_table_captured;
+    }
+    const ebpf_base_map_client_dispatch_table_t*
+    client_dispatch_table() const
+    {
+        return &_client_dispatch_table;
+    }
+    const ebpf_extension_header_t&
+    published_client_table_header() const
+    {
+        return _published_header;
+    }
+    size_t
+    client_table_bytes_copied() const
+    {
+        return _client_table_bytes_copied;
+    }
+
+    // The gate a real consumer uses to decide whether an appended member is present: the runtime must have advertised
+    // a table at least large enough to contain it. This reads the header the consumer actually copied, which is why
+    // the fixture must synthesize genuine legacy header metadata rather than truncating the tail alone.
+    bool
+    advertises_attach_time_map_discovery() const
+    {
+        return _client_dispatch_table.header.total_size >=
+               EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_client_dispatch_table_t, map_release_provider_reference);
     }
 
     // The map used by the delete callbacks to probe whether the entry is still reachable in the base map at the
@@ -3187,6 +3274,12 @@ class custom_map_test_provider_t
     ebpf_base_map_provider_dispatch_table_t _dispatch_table = {};
 
     custom_map_test_shape_t _shape = CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE;
+    custom_map_test_client_table_view_t _client_table_view = CUSTOM_MAP_TEST_CLIENT_TABLE_CURRENT;
+    ebpf_base_map_client_dispatch_table_t _client_dispatch_table = {};
+    ebpf_base_map_client_dispatch_table_t _legacy_remote_table = {};
+    ebpf_extension_header_t _published_header = {};
+    size_t _client_table_bytes_copied = 0;
+    bool _client_table_captured = false;
     ebpf_map_t* _probe_map = nullptr;
     bool _reject_delete = false;
     void* _last_map_context = nullptr;
@@ -3398,6 +3491,71 @@ _wait_for_map_teardown(const custom_map_test_provider_t& provider, uint32_t expe
     // deterministic.
     REQUIRE(provider.delete_count() == expected_map_delete_count);
 }
+
+//
+// Compile-time ABI guards for ebpf_base_map_client_dispatch_table_t.
+//
+// Consumers copy this table size-clamped into their own (possibly older, possibly newer) struct, so the layout of the
+// pre-existing members is load-bearing ABI: reordering or inserting a member silently rebinds every existing
+// provider's function pointers. These asserts are stronger than any runtime check because they cannot be skipped.
+//
+using custom_map_client_table_t = ebpf_base_map_client_dispatch_table_t;
+
+static_assert(EBPF_OFFSET_OF(custom_map_client_table_t, header) == 0, "header must remain first");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, find_element_function) == sizeof(ebpf_extension_header_t),
+    "find_element_function must immediately follow the header");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_enter) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, find_element_function) + sizeof(void*),
+    "epoch_enter moved");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_exit) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_enter) + sizeof(void*),
+    "epoch_exit moved");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_allocate_with_tag) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_exit) + sizeof(void*),
+    "epoch_allocate_with_tag moved");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_allocate_cache_aligned_with_tag) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_allocate_with_tag) + sizeof(void*),
+    "epoch_allocate_cache_aligned_with_tag moved");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_free) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_allocate_cache_aligned_with_tag) + sizeof(void*),
+    "epoch_free moved");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, epoch_free_cache_aligned) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_free) + sizeof(void*),
+    "epoch_free_cache_aligned moved");
+
+// The two new members are appended AFTER every pre-existing member, in declaration order, and are the last members of
+// the struct.
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, program_reference_maps_by_type) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, epoch_free_cache_aligned) + sizeof(void*),
+    "program_reference_maps_by_type must be appended directly after epoch_free_cache_aligned");
+static_assert(
+    EBPF_OFFSET_OF(custom_map_client_table_t, map_release_provider_reference) ==
+        EBPF_OFFSET_OF(custom_map_client_table_t, program_reference_maps_by_type) + sizeof(void*),
+    "map_release_provider_reference must be appended directly after program_reference_maps_by_type");
+static_assert(
+    EBPF_SIZE_INCLUDING_FIELD(custom_map_client_table_t, map_release_provider_reference) ==
+        sizeof(custom_map_client_table_t),
+    "the appended members must be the last members of the struct");
+
+// The historical size must still describe exactly the pre-append table, and the current size must be larger.
+static_assert(
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0 ==
+        EBPF_SIZE_INCLUDING_FIELD(custom_map_client_table_t, epoch_free_cache_aligned),
+    "EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0 must describe the table as it shipped before the append");
+static_assert(
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE > EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0,
+    "the current client dispatch table size must be larger than the pre-append size");
+static_assert(
+    EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION == 1,
+    "appending a member must not bump the client dispatch table version; add a supported size instead");
 
 TEST_CASE("cpumap_map_type_and_v1_provider_crud", "[cpumap]")
 {
@@ -3687,9 +3845,10 @@ TEST_CASE("custom_map_cleanup_deprecated_pre_delete_unchanged", "[execution_cont
 
 TEST_CASE("ebpf_program_reference_maps_by_type", "[execution_context][custom_map_provider]")
 {
-    // Attach-time map enumeration (design section 8.2). The binding context handed to a map/hook provider at attach
-    // is an ebpf_link_t*, so the API resolves the attached program from the link, filters the program's associated
-    // maps by type, and hands back one reference per match.
+    // Attach-time map enumeration (design section 8.2). program_binding_context is the ebpf_link_t* the runtime
+    // supplies to a HOOK provider when a program attaches -- not the map-client attach context -- so the API
+    // resolves the attached program from the link, filters the program's associated maps by type, and hands back one
+    // reference per match.
     _ebpf_core_initializer core;
     core.initialize();
 
@@ -3861,4 +4020,289 @@ TEST_CASE("ebpf_program_reference_maps_by_type", "[execution_context][custom_map
     result = ebpf_program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
     release_all_references();
     REQUIRE(result == EBPF_INVALID_OBJECT);
+}
+
+TEST_CASE("custom_map_client_dispatch_table_publishes_new_members", "[execution_context][custom_map_provider]")
+{
+    // The two attach-time map-discovery APIs are delivered to extensions through the versioned client dispatch table,
+    // which is the same channel XSKMAP already uses for find_element_function and the epoch APIs. This test proves
+    // they are published and that calling THROUGH the table reaches the same behavior as calling the runtime
+    // functions directly.
+    _ebpf_core_initializer core;
+    core.initialize();
+
+    program_info_provider_t sample_program_info;
+    REQUIRE(sample_program_info.initialize(EBPF_PROGRAM_TYPE_SAMPLE) == EBPF_SUCCESS);
+
+    custom_map_test_provider_t cpumap_provider;
+    REQUIRE(
+        cpumap_provider.initialize(BPF_MAP_TYPE_CPUMAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) ==
+        EBPF_SUCCESS);
+
+    map_ptr cpumap_a;
+    map_ptr cpumap_b;
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap_a);
+    _create_custom_test_map(BPF_MAP_TYPE_CPUMAP, cpumap_b);
+
+    // The runtime publishes the table when it binds to the provider, which happens when the first map of the
+    // provider's type is created.
+    REQUIRE(cpumap_provider.client_table_captured());
+
+    // Appending members keeps version 1 and advertises the larger size, matching how the provider dispatch table grew
+    // when postprocess_map_delete_element was appended.
+    const ebpf_extension_header_t& published = cpumap_provider.published_client_table_header();
+    REQUIRE(published.version == EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION);
+    REQUIRE(published.version == 1);
+    REQUIRE(published.size == EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE);
+    REQUIRE(published.size > EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0);
+    REQUIRE(published.total_size == sizeof(ebpf_base_map_client_dispatch_table_t));
+    REQUIRE(cpumap_provider.client_table_bytes_copied() == sizeof(ebpf_base_map_client_dispatch_table_t));
+
+    // Positive control for header-size gating: with no version skew, the gate must report the appended members as
+    // advertised. The backward-compatibility test asserts the negative case against a synthesized legacy runtime.
+    REQUIRE(cpumap_provider.advertises_attach_time_map_discovery());
+
+    const ebpf_base_map_client_dispatch_table_t* dispatch = cpumap_provider.client_dispatch_table();
+
+    // Every pre-existing member is still populated.
+    REQUIRE(dispatch->find_element_function != nullptr);
+    REQUIRE(dispatch->epoch_enter != nullptr);
+    REQUIRE(dispatch->epoch_exit != nullptr);
+    REQUIRE(dispatch->epoch_allocate_with_tag != nullptr);
+    REQUIRE(dispatch->epoch_allocate_cache_aligned_with_tag != nullptr);
+    REQUIRE(dispatch->epoch_free != nullptr);
+    REQUIRE(dispatch->epoch_free_cache_aligned != nullptr);
+
+    // The appended members are populated with the runtime's own functions. This equality is only expressible because
+    // the table is initialized without a cast, so the public typedefs match the implementations exactly.
+    REQUIRE(dispatch->program_reference_maps_by_type != nullptr);
+    REQUIRE(dispatch->map_release_provider_reference != nullptr);
+    bool reference_maps_matches = (dispatch->program_reference_maps_by_type == ebpf_program_reference_maps_by_type);
+    bool release_reference_matches = (dispatch->map_release_provider_reference == ebpf_map_release_provider_reference);
+    REQUIRE(reference_maps_matches);
+    REQUIRE(release_reference_matches);
+
+    // Build an attached program so the table's attach-time APIs have something to enumerate.
+    const cxplat_utf8_string_t program_name{(uint8_t*)("cpumap_program"), 14};
+    const cxplat_utf8_string_t section_name{(uint8_t*)("sample"), 6};
+    const ebpf_program_parameters_t program_parameters{
+        EBPF_PROGRAM_TYPE_SAMPLE, EBPF_ATTACH_TYPE_SAMPLE, program_name, section_name};
+    program_ptr program;
+    {
+        ebpf_program_t* local_program = nullptr;
+        REQUIRE(ebpf_program_create(&program_parameters, &local_program) == EBPF_SUCCESS);
+        program.reset(local_program);
+    }
+
+    ebpf_map_t* associated_maps[] = {cpumap_a.get(), cpumap_b.get()};
+    REQUIRE(
+        ebpf_program_associate_maps(program.get(), associated_maps, EBPF_COUNT_OF(associated_maps)) == EBPF_SUCCESS);
+
+    single_instance_hook_t hook(EBPF_PROGRAM_TYPE_SAMPLE, EBPF_ATTACH_TYPE_SAMPLE);
+    REQUIRE(hook.initialize() == EBPF_SUCCESS);
+
+    link_ptr link;
+    {
+        ebpf_link_t* local_link = nullptr;
+        REQUIRE(ebpf_link_create(EBPF_ATTACH_TYPE_SAMPLE, nullptr, 0, &local_link) == EBPF_SUCCESS);
+        link.reset(local_link);
+    }
+    REQUIRE(ebpf_link_attach_program(link.get(), program.get()) == EBPF_SUCCESS);
+
+    uint32_t map_count = 0;
+    ebpf_map_provider_reference_t references[4] = {};
+
+    // Release the whole buffer before asserting, so a regression that wrongly hands out references fails fast instead
+    // of leaking a map reference and wedging NMR deregistration at teardown.
+    auto release_all_references = [&references, dispatch]() {
+        for (ebpf_map_provider_reference_t& reference : references) {
+            dispatch->map_release_provider_reference(&reference);
+            reference = {};
+        }
+    };
+
+    // No map of the requested type, called through the table.
+    map_count = EBPF_COUNT_OF(references);
+    ebpf_result_t result =
+        dispatch->program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_XSKMAP, references, &map_count);
+    uint32_t reported_count = map_count;
+    release_all_references();
+    REQUIRE(result == EBPF_KEY_NOT_FOUND);
+    REQUIRE(reported_count == 0);
+
+    int64_t cpumap_a_references = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+    int64_t cpumap_b_references = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+
+    // Two-pass sizing through the table.
+    map_count = 0;
+    result = dispatch->program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, nullptr, &map_count);
+    reported_count = map_count;
+    release_all_references();
+    REQUIRE(result == EBPF_INSUFFICIENT_BUFFER);
+    REQUIRE(reported_count == 2);
+
+    map_count = EBPF_COUNT_OF(references);
+    result = dispatch->program_reference_maps_by_type(link.get(), BPF_MAP_TYPE_CPUMAP, references, &map_count);
+    reported_count = map_count;
+    int64_t cpumap_a_after = ((ebpf_core_object_t*)cpumap_a.get())->base.reference_count;
+    int64_t cpumap_b_after = ((ebpf_core_object_t*)cpumap_b.get())->base.reference_count;
+    std::vector<ebpf_map_provider_reference_t> returned(references, references + EBPF_COUNT_OF(references));
+    release_all_references();
+
+    REQUIRE(result == EBPF_SUCCESS);
+    REQUIRE(reported_count == 2);
+    REQUIRE(cpumap_a_after == cpumap_a_references + 1);
+    REQUIRE(cpumap_b_after == cpumap_b_references + 1);
+
+    // Release through the table returns the counts to their original values.
+    REQUIRE(((ebpf_core_object_t*)cpumap_a.get())->base.reference_count == cpumap_a_references);
+    REQUIRE(((ebpf_core_object_t*)cpumap_b.get())->base.reference_count == cpumap_b_references);
+
+    std::set<const void*> referenced_maps;
+    for (uint32_t i = 0; i < reported_count; i++) {
+        CHECK(returned[i].map_type == BPF_MAP_TYPE_CPUMAP);
+        CHECK(returned[i].provider_map_context != nullptr);
+        CHECK(referenced_maps.insert(returned[i].map_object).second);
+    }
+    REQUIRE(referenced_maps.find(cpumap_a.get()) != referenced_maps.end());
+    REQUIRE(referenced_maps.find(cpumap_b.get()) != referenced_maps.end());
+
+    // Releasing a NULL reference through the table is a no-op rather than a crash.
+    dispatch->map_release_provider_reference(nullptr);
+
+    ebpf_link_detach_program(link.get());
+}
+
+TEST_CASE("custom_map_old_client_dispatch_table_still_works", "[execution_context][custom_map_provider]")
+{
+    // Backward compatibility in both skew directions. These are NOT the same scenario with the same metadata: each
+    // has its own distinct, correct header, and the test asserts that metadata rather than only the absent tail.
+    //
+    //   OLD_CONSUMER: extension built before the append, bound to a CURRENT runtime. The runtime advertises the
+    //                 current size and total_size; the extension's own struct is smaller, so it copies fewer bytes.
+    //                 Header-size gating would report the members as advertised -- the extension simply has no field
+    //                 to hold them.
+    //   OLD_RUNTIME:  CURRENT extension bound to a runtime that predates the append. The runtime advertises the OLD
+    //                 size and total_size, so header-size gating must report the members as absent and the clamp
+    //                 leaves them zero in the extension's full-size struct.
+    //
+    // In both cases attach must succeed and every service the consumer does know about must keep working. This is
+    // what protects the existing XSKMAP provider.
+    const size_t current_size = EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE;
+    const size_t current_total_size = sizeof(ebpf_base_map_client_dispatch_table_t);
+    const size_t legacy_size = EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0;
+
+    struct view_case
+    {
+        custom_map_test_client_table_view_t view;
+        size_t expected_header_size;
+        size_t expected_header_total_size;
+        size_t expected_bytes_copied;
+        bool expected_attach_apis_advertised;
+        const char* description;
+    };
+    const view_case view_cases[] = {
+        {CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_CONSUMER,
+         current_size,
+         current_total_size,
+         legacy_size,
+         true,
+         "extension built before the append, bound to a current runtime"},
+        {CUSTOM_MAP_TEST_CLIENT_TABLE_OLD_RUNTIME,
+         legacy_size,
+         legacy_size,
+         legacy_size,
+         false,
+         "current extension bound to a runtime that predates the append"},
+    };
+
+    // The two directions must be distinguishable, otherwise the loop below is testing one scenario twice.
+    REQUIRE(view_cases[0].expected_header_size != view_cases[1].expected_header_size);
+    REQUIRE(view_cases[0].expected_header_total_size != view_cases[1].expected_header_total_size);
+    REQUIRE(view_cases[0].expected_attach_apis_advertised != view_cases[1].expected_attach_apis_advertised);
+
+    for (const view_case& test_case : view_cases) {
+        CAPTURE(test_case.description);
+
+        _ebpf_core_initializer core;
+        core.initialize();
+
+        custom_map_test_provider_t provider;
+        provider.set_client_table_view(test_case.view);
+        REQUIRE(
+            provider.initialize(BPF_MAP_TYPE_SAMPLE_HASH_MAP, CUSTOM_MAP_TEST_SHAPE_POST_DELETE_WITH_UPDATE, true) ==
+            EBPF_SUCCESS);
+
+        // Attach must succeed: creating the map is what drives the provider binding.
+        map_ptr map;
+        _create_custom_test_map(BPF_MAP_TYPE_SAMPLE_HASH_MAP, map);
+        REQUIRE(provider.client_table_captured());
+
+        // The table the consumer was presented with carries this direction's own metadata.
+        const ebpf_extension_header_t& published = provider.published_client_table_header();
+        REQUIRE(published.version == EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION);
+        REQUIRE(published.size == test_case.expected_header_size);
+        REQUIRE(published.total_size == test_case.expected_header_total_size);
+        REQUIRE(provider.client_table_bytes_copied() == test_case.expected_bytes_copied);
+
+        const ebpf_base_map_client_dispatch_table_t* dispatch = provider.client_dispatch_table();
+
+        // The header the consumer actually copied carries the same metadata, which is what header-size gating reads.
+        REQUIRE(dispatch->header.version == EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION);
+        REQUIRE(dispatch->header.size == test_case.expected_header_size);
+        REQUIRE(dispatch->header.total_size == test_case.expected_header_total_size);
+        REQUIRE(provider.advertises_attach_time_map_discovery() == test_case.expected_attach_apis_advertised);
+
+        // Everything that existed before the append is intact.
+        REQUIRE(dispatch->find_element_function != nullptr);
+        REQUIRE(dispatch->epoch_enter != nullptr);
+        REQUIRE(dispatch->epoch_exit != nullptr);
+        REQUIRE(dispatch->epoch_allocate_with_tag != nullptr);
+        REQUIRE(dispatch->epoch_allocate_cache_aligned_with_tag != nullptr);
+        REQUIRE(dispatch->epoch_free != nullptr);
+        REQUIRE(dispatch->epoch_free_cache_aligned != nullptr);
+
+        // The appended members were never copied, so they read as NULL in both directions -- for OLD_CONSUMER because
+        // they lie outside its own struct, for OLD_RUNTIME because the runtime never published them. Every member
+        // added after epoch_free_cache_aligned is optional and MUST be NULL-checked (or gated on header.total_size,
+        // asserted above) before use; a consumer that calls blindly dereferences NULL.
+        REQUIRE(dispatch->program_reference_maps_by_type == nullptr);
+        REQUIRE(dispatch->map_release_provider_reference == nullptr);
+
+        // The epoch services still work end to end through the table.
+        epoch_state_t epoch_state;
+        dispatch->epoch_enter(&epoch_state);
+        void* memory = dispatch->epoch_allocate_with_tag(64, EBPF_POOL_TAG_DEFAULT);
+        REQUIRE(memory != nullptr);
+        dispatch->epoch_free(memory);
+        void* aligned_memory = dispatch->epoch_allocate_cache_aligned_with_tag(64, EBPF_POOL_TAG_DEFAULT);
+        REQUIRE(aligned_memory != nullptr);
+        dispatch->epoch_free_cache_aligned(aligned_memory);
+        dispatch->epoch_exit(&epoch_state);
+
+        // Map CRUD, including the runtime's find_element_function, still works.
+        REQUIRE(_update_uint32_entry(map.get(), 31, 3100) == EBPF_SUCCESS);
+        uint32_t value = 0;
+        REQUIRE(_find_uint32_entry(map.get(), 31, &value) == EBPF_SUCCESS);
+        REQUIRE(value == 3100);
+
+        uint32_t key = 31;
+        dispatch->epoch_enter(&epoch_state);
+        uint8_t* found_value = nullptr;
+        REQUIRE(dispatch->find_element_function(map.get(), (const uint8_t*)&key, &found_value) == EBPF_SUCCESS);
+        REQUIRE(found_value != nullptr);
+        REQUIRE(*(uint32_t*)found_value == 3100);
+        dispatch->epoch_exit(&epoch_state);
+
+        // The post-delete ordering contract is unaffected by the table growing.
+        provider.set_probe_map(map.get());
+        REQUIRE(ebpf_map_delete_entry(map.get(), sizeof(key), (const uint8_t*)&key, 0) == EBPF_SUCCESS);
+        REQUIRE(provider.delete_element_count() == 1);
+        REQUIRE(provider.delete_probe_absent() == 1);
+        REQUIRE(provider.delete_probe_present() == 0);
+
+        map.reset();
+        _wait_for_map_teardown(provider, 1);
+        provider.set_probe_map(nullptr);
+    }
 }

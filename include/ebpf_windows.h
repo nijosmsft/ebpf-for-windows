@@ -203,8 +203,13 @@ typedef enum _ebpf_helper_function
      EBPF_BASE_MAP_PROVIDER_PROPERTIES_CURRENT_VERSION_TOTAL_SIZE}
 
 #define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION 1
-#define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE \
+// Size of the table as it shipped before program_reference_maps_by_type / map_release_provider_reference were
+// appended. The version is intentionally NOT bumped for an append; the older size is recorded and stays valid,
+// matching how EBPF_BASE_MAP_PROVIDER_DISPATCH_TABLE_V1_SIZE_0 coexists with the current provider-table size.
+#define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_V1_SIZE_0 \
     EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_client_dispatch_table_t, epoch_free_cache_aligned)
+#define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_SIZE \
+    EBPF_SIZE_INCLUDING_FIELD(ebpf_base_map_client_dispatch_table_t, map_release_provider_reference)
 #define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION_TOTAL_SIZE sizeof(ebpf_base_map_client_dispatch_table_t)
 #define EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_HEADER             \
     {EBPF_BASE_MAP_CLIENT_DISPATCH_TABLE_CURRENT_VERSION,      \

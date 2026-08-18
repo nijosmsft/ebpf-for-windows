@@ -183,14 +183,16 @@ extern "C"
      * dispatch table or the NMR binding context to the caller. Each returned reference must be released with
      * ebpf_map_release_provider_reference.
      *
-     * The binding context handed to a map/hook provider at attach time is an ebpf_link_t*, so the implementation
-     * resolves the attached program under link synchronization and holds a reference on it while enumerating.
+     * @p program_binding_context is the client binding context the runtime supplies to a HOOK provider when a program
+     * attaches: an ebpf_link_t*. It is NOT the binding context of the map-client attach, which is the runtime's own
+     * map object and carries a NULL client dispatch argument. The implementation resolves the attached program from
+     * the link under link synchronization and holds a reference on it while enumerating.
      *
      * Two-pass sizing: call with maps == NULL (or a buffer that is too small) to learn the required count in
      * map_count, then call again with a buffer of at least that size. map_count is always written with the number of
      * matching maps, whether or not the buffer was large enough.
      *
-     * @param[in] program_binding_context The link binding context supplied to the provider at attach.
+     * @param[in] program_binding_context The link binding context supplied to the hook provider at program attach.
      * @param[in] map_type The map type to match.
      * @param[out] maps Caller buffer receiving the references, or NULL to query the required count.
      * @param[in,out] map_count On input, the capacity of @p maps. On output, the number of matching maps.

@@ -1678,10 +1678,11 @@ _IRQL_requires_max_(PASSIVE_LEVEL) _Must_inspect_result_ ebpf_result_t ebpf_prog
         EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
     }
 
-    // The binding context handed to a map/hook provider at attach time is the ebpf_link_t* that the link registered as
-    // its NMR client context (see _ebpf_link_client_attach_provider). Resolve the owning program from the link under
-    // link synchronization and hold a reference on it across the enumeration so it cannot be detached and freed
-    // underneath us.
+    // program_binding_context is the ebpf_link_t* that the link registers as its NMR client context when a program
+    // attaches to a hook provider (see _ebpf_link_client_attach_provider). It is not the map-client attach context,
+    // which is the runtime's own map object and carries a NULL client dispatch argument. Resolve the owning program
+    // from the link under link synchronization and hold a reference on it across the enumeration so it cannot be
+    // detached and freed underneath us.
     ebpf_core_object_t* object = (ebpf_core_object_t*)program_binding_context;
     if (object->type != EBPF_OBJECT_LINK) {
         EBPF_RETURN_RESULT(EBPF_INVALID_OBJECT);

@@ -47,7 +47,7 @@ is adding a new attach type for an existing program type, then it only needs to 
 
 ### 1.3.3 eBPF Map Information NPI Provider
 The Map Information NPI contract is used by extension to provide an implementation for a map type that is not already
-implemented by the eBPF runtime. An example for this can be *BPF_MAP_TYPE_XSKMAP*. The eBPF extension must register
+implemented by the eBPF runtime. Examples of this are *BPF_MAP_TYPE_XSKMAP* and *BPF_MAP_TYPE_CPUMAP*. The eBPF extension must register
 a separate Map Information NPI provider module for each map type it implements.
 
 ## 2 Authoring an eBPF Extension
@@ -634,7 +634,8 @@ This is the dispatch table that the extension needs to implement and provide to 
 6. `preprocess_map_delete_element` - **(Deprecated)** Function to pre-process a map entry before a delete operation. Called under the per-bucket lock. New providers should use `postprocess_map_delete_element` instead.
 7. `postprocess_map_delete_element` - **(Preferred)** Function to post-process a map entry after a delete operation. Called after the per-bucket lock is released.
 
-A provider must set **exactly one** of `preprocess_map_delete_element` or `postprocess_map_delete_element`, not both.
+A provider must set **at most one** of `preprocess_map_delete_element` or `postprocess_map_delete_element`, never both.
+When `updates_original_value` is true, one of them is required; when it is false, setting neither is permitted.
 Old providers compiled against the previous SDK will only have `preprocess_map_delete_element`; the runtime detects
 this via the `header.size` field and treats `postprocess_map_delete_element` as NULL.
 
@@ -670,14 +671,36 @@ typedef struct _ebpf_map_client_dispatch_table
     ebpf_epoch_allocate_cache_aligned_with_tag_t epoch_allocate_cache_aligned_with_tag;
     ebpf_epoch_free_t epoch_free;
     ebpf_epoch_free_cache_aligned_t epoch_free_cache_aligned;
+    ebpf_program_reference_maps_by_type_t program_reference_maps_by_type; ///< Optional. NULL on an older runtime.
+    ebpf_map_release_provider_reference_t map_release_provider_reference; ///< Optional. NULL on an older runtime.
 } ebpf_base_map_client_dispatch_table_t;
 ```
 The client dispatch table provides *epoch based memory management* APIs that extension can use for allocating
 memory when implementing custom maps.
 See [Epoch based memory management](https://github.com/microsoft/ebpf-for-windows/blob/main/docs/EpochBasedMemoryManagement.md) for more details on this topic.
 
-Along with that, the client dispatch table also contains the below function:
+Along with that, the client dispatch table also contains the below functions:
 `find_element_function` - Used by extension to query a map value given the key.
+`program_reference_maps_by_type` - Used by extension to reference, at program attach time, the maps of a given type
+that are associated with the attaching program. It takes the `ebpf_link_t*` that the extension receives as the client
+binding context on its **hook-provider** binding, not the binding context of the map-client attach. Because this table
+arrives on the map-client binding, an extension that owns both a custom map type and a program hook must capture the
+table during map-client attach and reach it from its hook-provider attach path. See [Custom Maps](CustomMaps.md).
+`map_release_provider_reference` - Used by extension to release one such reference.
+
+This table is append-only and its version is **not** bumped when a member is added; the new size is added to the list
+of supported sizes instead, exactly as was done for `ebpf_base_map_provider_dispatch_table_t` when
+`postprocess_map_delete_element` was appended. Extensions must therefore copy the table size-clamped into a
+zero-initialized local struct:
+```
+memcpy(
+    &local_table,
+    client_data->base_client_table,
+    min(sizeof(local_table), client_data->base_client_table->header.total_size));
+```
+An extension built against a newer SDK than the runtime it binds to will see the trailing members left as zero, so
+every member added after `epoch_free_cache_aligned` is optional and must be NULL-checked before it is called. See
+[Custom Maps](CustomMaps.md) for the full contract.
 
 ### 2.8 Authoring Helper Functions
 An extension can provide an implementation of helper functions that can be invoked by eBPF programs. This legacy

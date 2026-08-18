@@ -466,6 +466,56 @@ typedef ebpf_result_t (*ebpf_map_find_element_t)(
     _In_ const void* map, _In_ const uint8_t* key, _Outptr_ uint8_t** value);
 
 /**
+ * @brief Reference every associated map of a given type for an attached eBPF program.
+ *
+ * Attach-time service used by trusted kernel extensions that own a custom map type and need to discover which of
+ * their maps an attaching program uses. The runtime resolves the attached program from the supplied link binding
+ * context under link synchronization and takes one reference per matching map. Each returned reference must be
+ * released with ebpf_map_release_provider_reference_t.
+ *
+ * IMPORTANT - where program_binding_context comes from. It is the client binding context the runtime supplies to a
+ * HOOK provider when a program attaches: an ebpf_link_t*, passed as the client binding context of the link's NMR
+ * client (ebpf_link.c, NmrClientAttachProvider(nmr_binding_handle, link, ...)). It is NOT the binding context of the
+ * map-provider NPI, which is the runtime's internal map object and is accompanied by a NULL client dispatch
+ * (ebpf_maps.c, NmrClientAttachProvider(nmr_binding_handle, custom_map, NULL, ...)). See the note on
+ * ebpf_base_map_client_dispatch_table_t for how an extension bridges the two bindings.
+ *
+ * Two-pass sizing: call with maps == NULL (or a buffer that is too small) to learn the required count in map_count,
+ * then call again with a buffer of at least that size. map_count is always written with the number of matching maps,
+ * whether or not the buffer was large enough.
+ *
+ * @param[in] program_binding_context The link binding context supplied to the hook provider at program attach.
+ * @param[in] map_type The map type to match.
+ * @param[out] maps Caller buffer receiving the references, or NULL to query the required count.
+ * @param[in,out] map_count On input, the capacity of @p maps. On output, the number of matching maps.
+ *
+ * @retval EBPF_SUCCESS All matching maps were referenced.
+ * @retval EBPF_INSUFFICIENT_BUFFER @p maps was NULL or too small; @p map_count holds the required count.
+ * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+ * @retval EBPF_INVALID_OBJECT The link, program, or a matching map is not valid.
+ * @retval EBPF_KEY_NOT_FOUND No map of the requested type is associated with the program.
+ *
+ * IRQL: PASSIVE_LEVEL. This does not need to be called inside an epoch-protected region.
+ */
+typedef ebpf_result_t (*ebpf_program_reference_maps_by_type_t)(
+    _In_ const void* program_binding_context,
+    ebpf_map_type_t map_type,
+    _Out_writes_to_opt_(*map_count, *map_count) ebpf_map_provider_reference_t* maps,
+    _Inout_ uint32_t* map_count);
+
+/**
+ * @brief Release one reference obtained from ebpf_program_reference_maps_by_type_t.
+ *
+ * Releasing a NULL pointer, or a reference whose map_object is NULL, is a no-op. This never invokes provider
+ * callbacks, never allocates and never waits.
+ *
+ * @param[in] map_reference The reference to release.
+ *
+ * IRQL: <= DISPATCH_LEVEL. This does not need to be called inside an epoch-protected region.
+ */
+typedef void (*ebpf_map_release_provider_reference_t)(_In_ const ebpf_map_provider_reference_t* map_reference);
+
+/**
  * Dispatch table implemented by the eBPF runtime to provide RCU / epoch operations.
  *
  * Notes:
@@ -489,6 +539,41 @@ typedef ebpf_result_t (*ebpf_map_find_element_t)(
  *
  * Similarly, `find_element_function` can only be invoked in an epoch-protected region, as explained above. Calling it
  * from outside an epoch-protected region may lead to undefined behavior.
+ *
+ * Attach-time map discovery functions:
+ * - `program_reference_maps_by_type`: reference the attached program's maps of a given type.
+ * - `map_release_provider_reference`: release one such reference.
+ *
+ * Unlike the epoch and find functions above, these two do NOT need to be called inside an epoch-protected region.
+ *
+ * THESE TWO SPAN TWO DIFFERENT NMR BINDINGS, and an extension must bridge them:
+ *
+ * - This table arrives on the MAP-CLIENT binding. The runtime registers an NMR client for each custom map it creates
+ *   and publishes the table through `ebpf_map_client_data_t.base_client_table` in the client's NPI-specific
+ *   characteristics. The client binding context on that attach is the runtime's own map object, and the client
+ *   dispatch argument to NmrClientAttachProvider is NULL, so the table must be read from the client data, not from
+ *   the dispatch argument.
+ * - `program_reference_maps_by_type` consumes an `ebpf_link_t*`, which the extension only receives on its
+ *   HOOK-PROVIDER binding, when a program attaches.
+ *
+ * An extension that owns both a custom map type and a program hook must therefore capture this table during
+ * map-client attach, store it somewhere reachable from its hook-provider attach path, and call
+ * `program_reference_maps_by_type` from there with the link binding context.
+ *
+ * Ordering follows from that: the table is only held once at least one map of the extension's type exists. That is
+ * sufficient, because if the extension has never received the table then no map of its type has ever been created,
+ * so an attaching program cannot be referencing one.
+ *
+ * COMPATIBILITY: this structure is append-only. Members are only ever added at the end, and the version field is not
+ * bumped for an append; instead a new supported size is added. A consumer MUST copy the table size-clamped, for
+ * example:
+ *
+ *     memcpy(&local_table, remote_table, min(sizeof(local_table), remote_table->header.total_size));
+ *
+ * A consumer built against a newer SDK than the runtime it binds to will therefore see the trailing members left as
+ * zero. Every member added after `epoch_free_cache_aligned` is OPTIONAL and MUST be NULL-checked (or gated on
+ * `header.total_size`) before it is called. `program_reference_maps_by_type` and `map_release_provider_reference` are
+ * the first such members. The seven members up to and including `epoch_free_cache_aligned` are always present.
  */
 typedef struct _ebpf_map_client_dispatch_table
 {
@@ -500,6 +585,8 @@ typedef struct _ebpf_map_client_dispatch_table
     ebpf_epoch_allocate_cache_aligned_with_tag_t epoch_allocate_cache_aligned_with_tag;
     ebpf_epoch_free_t epoch_free;
     ebpf_epoch_free_cache_aligned_t epoch_free_cache_aligned;
+    ebpf_program_reference_maps_by_type_t program_reference_maps_by_type; ///< Optional. NULL on an older runtime.
+    ebpf_map_release_provider_reference_t map_release_provider_reference; ///< Optional. NULL on an older runtime.
 } ebpf_base_map_client_dispatch_table_t;
 
 /**
