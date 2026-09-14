@@ -5,6 +5,8 @@
 #include "ebpf_hash_table.h"
 #include "performance.h"
 
+#include <atomic>
+
 static void
 _perf_epoch_enter_exit()
 {
@@ -78,9 +80,10 @@ typedef class _ebpf_hash_table_test_state
   public:
     _ebpf_hash_table_test_state()
     {
-        cpu_count = ebpf_get_cpu_count();
         REQUIRE(ebpf_platform_initiate() == EBPF_SUCCESS);
         platform_initiated = true;
+        cpu_count = ebpf_get_cpu_count();
+        REQUIRE(cpu_count > 0);
         REQUIRE(ebpf_random_initiate() == EBPF_SUCCESS);
         REQUIRE(ebpf_epoch_initiate() == EBPF_SUCCESS);
         epoch_initiated = true;
@@ -149,6 +152,28 @@ typedef class _ebpf_hash_table_test_state
     }
 
     void
+    test_find_read_shared_value()
+    {
+        const auto& key = keys.front();
+        ebpf_epoch_state_t epoch_state;
+        ebpf_epoch_enter(&epoch_state);
+        for (size_t index = 0; index < PERFORMANCE_MEASURE_BATCH_SIZE; index++) {
+            uint8_t* value = nullptr;
+            if (ebpf_hash_table_find(table, reinterpret_cast<const uint8_t*>(&key), &value) != EBPF_SUCCESS ||
+                value == nullptr || *reinterpret_cast<const volatile uint64_t*>(value) != 12345678) {
+                read_failed.store(true, std::memory_order_relaxed);
+            }
+        }
+        ebpf_epoch_exit(&epoch_state);
+    }
+
+    bool
+    read_values_valid() const
+    {
+        return !read_failed.load(std::memory_order_relaxed);
+    }
+
+    void
     test_replace_value(uint32_t current_cpu)
     {
         uint64_t value = 12345678;
@@ -202,6 +227,7 @@ typedef class _ebpf_hash_table_test_state
     bool platform_initiated = false;
     bool epoch_initiated = false;
     uint32_t cpu_count;
+    std::atomic<bool> read_failed{false};
 
 } ebpf_hash_table_test_state_t;
 
@@ -211,6 +237,12 @@ static void
 _ebpf_hash_table_test_find()
 {
     _ebpf_hash_table_test_state_instance->test_find();
+}
+
+static void
+_ebpf_hash_table_test_find_read_shared_value()
+{
+    _ebpf_hash_table_test_state_instance->test_find_read_shared_value();
 }
 
 static void
@@ -301,6 +333,20 @@ test_ebpf_hash_table_find(bool preemptible)
 }
 
 void
+test_ebpf_hash_table_find_read_shared_value(bool preemptible)
+{
+    _ebpf_hash_table_test_state instance;
+    _ebpf_hash_table_test_state_instance = &instance;
+    _performance_measure measure(
+        __FUNCTION__,
+        preemptible,
+        _ebpf_hash_table_test_find_read_shared_value,
+        PERFORMANCE_MEASURE_ITERATION_COUNT / 1000);
+    measure.run_test(PERFORMANCE_MEASURE_BATCH_SIZE);
+    REQUIRE(instance.read_values_valid());
+}
+
+void
 test_ebpf_hash_table_next_key(bool preemptible)
 {
     _ebpf_hash_table_test_state instance;
@@ -335,6 +381,7 @@ test_ebpf_hash_table_update_overlapping(bool preemptible)
 PERF_TEST(test_epoch_enter_exit);
 PERF_TEST(test_epoch_enter_exit_alloc_free);
 PERF_TEST(test_ebpf_hash_table_find);
+PERF_TEST(test_ebpf_hash_table_find_read_shared_value);
 PERF_TEST(test_ebpf_hash_table_next_key);
 PERF_TEST(test_ebpf_hash_table_update);
 PERF_TEST(test_ebpf_hash_table_update_overlapping);

@@ -477,6 +477,51 @@ run_in_epoch(std::function<void()> function)
     function();
 }
 
+TEST_CASE("hash_table_shared_read_value", "[platform]")
+{
+    _test_helper test_helper;
+    test_helper.initialize();
+    const uint32_t key = 7;
+    const uint64_t expected = 0x123456789abcdef0;
+    const ebpf_hash_table_creation_options_t options = {
+        .key_size = sizeof(key),
+        .value_size = sizeof(expected),
+        .minimum_bucket_count = 1,
+    };
+    ebpf_hash_table_t* raw_table = nullptr;
+    REQUIRE(ebpf_hash_table_create(&raw_table, &options) == EBPF_SUCCESS);
+    ebpf_hash_table_ptr table(raw_table);
+    REQUIRE(
+        ebpf_hash_table_update(
+            table.get(),
+            nullptr,
+            reinterpret_cast<const uint8_t*>(&key),
+            reinterpret_cast<const uint8_t*>(&expected),
+            EBPF_HASH_TABLE_OPERATION_INSERT) == EBPF_SUCCESS);
+
+    std::atomic<uint32_t> failures{0};
+    std::vector<std::jthread> threads;
+    const uint32_t worker_count = std::min(8u, std::max(2u, ebpf_get_cpu_count()));
+    for (uint32_t worker = 0; worker < worker_count; worker++) {
+        threads.emplace_back([&]() {
+            for (size_t iteration = 0; iteration < 1000; iteration++) {
+                run_in_epoch([&]() {
+                    uint8_t* value = nullptr;
+                    if (ebpf_hash_table_find(table.get(), reinterpret_cast<const uint8_t*>(&key), &value) !=
+                            EBPF_SUCCESS ||
+                        value == nullptr || *reinterpret_cast<const volatile uint64_t*>(value) != expected) {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    CHECK(failures.load(std::memory_order_relaxed) == 0);
+}
+
 TEST_CASE("hash_table_stress_test", "[platform]")
 {
     _test_helper test_helper;

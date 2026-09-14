@@ -1024,7 +1024,8 @@ ebpf_hash_table_find(_In_ const ebpf_hash_table_t* hash_table, _In_ const uint8_
         goto Done;
     }
 
-    PrefetchForWrite(data);
+    // A lookup does not imply a write; avoid invalidating other readers' cache lines.
+    PreFetchCacheLine(PF_TEMPORAL_LEVEL_1, data);
 
     *value = data;
     if (hash_table->notification_callback && (hash_table->notification_flags & EBPF_HASH_TABLE_NOTIFICATION_TYPE_USE)) {
