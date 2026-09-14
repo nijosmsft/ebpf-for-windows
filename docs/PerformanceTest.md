@@ -39,6 +39,22 @@ These tests assess the eBPF runtime's map implementation performance and include
 2. **Write**: A random element is selected, and a new value is written (variants may include insert and replace).
 3. **Insert/Delete**: A random element is deleted from the map and subsequently re-inserted.
 
+The in-process platform suite also includes
+`test_ebpf_hash_table_find_read_shared_value_preemption` and its
+`_no_preemption` variant in `ebpf_performance.exe`. Every worker repeatedly
+looks up the same key and reads the returned value. This distinguishes a
+read-only shared-value workload from a lookup that only tests whether a key
+exists: a write-prefetch hint can invalidate other readers' cache lines even
+when no application writes the value. Hash lookup uses a temporal read-prefetch
+hint; callers can still modify returned values under the existing map contract.
+
+The benchmark initializes the platform before querying the CPU count, verifies
+that the count is nonzero, and checks the value read by each worker. An epoch
+protects each batch of 1,024 reads to amortize usersim epoch-management overhead.
+The reported duration is divided by the actual number of reads. Compare repeated
+baseline/candidate runs on the same processor topology; this microbenchmark does
+not replace end-to-end workload measurements.
+
 ## Type-Specific Map
 
 Certain maps possess unique properties that differentiate them. These maps include, but are not limited to:
